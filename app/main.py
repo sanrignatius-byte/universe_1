@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import logging
 import os
 import queue
@@ -12,7 +13,7 @@ from fastapi.responses import FileResponse, ORJSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import validate
-from .store import Job, Store
+from .store import MAX_DB_BYTES, MIN_FREE_BYTES, Job, Store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 DB_PATH = os.environ.get("DB_PATH", "/data/cosmos.db")
@@ -92,7 +93,10 @@ async def ingest(request: Request):
             return _resp(503, "busy")
         return _resp(j.code, err)
     cost = len(m["objects"]) if m["kind"] == "objects" else 1
-    code, detail = await _submit(Job(m["kind"], m, len(body), cost))
+    # content digest of the canonical (key-sorted) message: a re-send with the same id is
+    # only a duplicate if the content is the same
+    digest = hashlib.blake2b(orjson.dumps(m, option=orjson.OPT_SORT_KEYS), digest_size=16).digest()
+    code, detail = await _submit(Job(m["kind"], m, len(body), cost, digest))
     return _resp(code, detail)
 
 
@@ -184,6 +188,8 @@ def overview(test: str = None):
             "sync": "NORMAL" if os.environ.get("SQLITE_SYNC", "FULL").upper() == "NORMAL" else "FULL",
         },
         "db_bytes": db_bytes,
+        "disk": {"free_bytes": store.disk["free_bytes"], "budget_reached": store.disk["full"],
+                 "max_db_bytes": MAX_DB_BYTES, "min_free_bytes": MIN_FREE_BYTES},
         "uptime_s": int(time.time() - started),
     }
 
@@ -275,21 +281,35 @@ def changes(test: str = None, limit: int = 300):
     return {"revisions": revs, "changes": ch}
 
 
+MAP_WINDOW = 300000  # scan at most the newest N objects for one frame
+
+
 @app.get("/api/map")
-def sky_map(test: str = None, frame: str = "galactic", type: int = None, limit: int = 20000):
+def sky_map(test: str = None, kind: str = None, frame_id: str = None, unit: str = None,
+            type: int = None, limit: int = 20000):
+    """Points of ONE reference frame (kind + frame_id + unit). Different local frames
+    have no known transform between them, so they are never mixed in one plot."""
     tk = _tk(test)
+    c = store.reader()
     limit = max(1, min(limit, 100000))
-    where, args = ["test_key=?", "frame_kind=?"], [tk, frame]
+    frames = [dict(r) for r in c.execute(
+        "SELECT frame_kind, frame_id, unit, n FROM frames WHERE test_key=? ORDER BY n DESC LIMIT 200", (tk,))]
+    if kind is None and frames:
+        kind, frame_id, unit = frames[0]["frame_kind"], frames[0]["frame_id"], frames[0]["unit"]
+    if kind is None:
+        return {"frames": frames, "frame": None, "points": []}
+    maxseq = c.execute("SELECT MAX(seq) FROM objects WHERE test_key=?", (tk,)).fetchone()[0] or 0
+    where = ["test_key=?", "seq>?", "frame_kind=?", "frame_id IS ?", "unit IS ?"]
+    args = [tk, maxseq - MAP_WINDOW, kind, frame_id, unit]
     if type is not None:
         ids = _subtree(tk, type)
         where.append(f"type_id IN ({','.join('?' * len(ids))})")
         args += ids
-    rows = store.reader().execute(
+    rows = c.execute(
         f"SELECT seq, type_id, x, y, z FROM objects WHERE {' AND '.join(where)} ORDER BY seq DESC LIMIT ?",
         args + [limit]).fetchall()
-    frames = [r[0] for r in store.reader().execute(
-        "SELECT DISTINCT frame_kind FROM objects WHERE test_key=? AND frame_kind IS NOT NULL LIMIT 20", (tk,))]
-    return {"frames": frames, "points": [list(r) for r in rows]}
+    return {"frames": frames, "frame": {"frame_kind": kind, "frame_id": frame_id, "unit": unit},
+            "window": MAP_WINDOW, "points": [list(r) for r in rows]}
 
 
 @app.get("/api/rejects")
@@ -324,31 +344,44 @@ async def reconcile(request: Request):
     f_sent, f_ack, f_rej = _bits(inj.get("fault_sent_bitmap")), _bits(inj.get("fault_ack_bitmap")), _bits(inj.get("fault_rejected_bitmap"))
     d_sent, d_ack = _bits(inj.get("duplicate_sent_bitmap")), _bits(inj.get("duplicate_ack_bitmap"))
     c = store.reader()
-    stored, stored_objs = set(), 0
+    stored = {}
     for bid, n in c.execute("SELECT batch_id, n FROM batches WHERE test_key=?", (tk,)):
-        stored.add(bid)
-        if bid < offset:
-            stored_objs += n
+        stored[bid] = n
     normal = {b for b in stored if b < offset}
     faults_stored = {b - offset for b in stored if b >= offset}
+    stored_objs = sum(stored[b] for b in normal)
+    acked_objs_in_store = sum(stored[b] for b in acked & normal)
+    gen_acked_objs = r.get("stats", {}).get("acknowledged_objects")
     obj_rows = c.execute("SELECT COUNT(*) FROM objects WHERE test_key=?", (tk,)).fetchone()[0]
-    st = c.execute("SELECT tree_rev, dup_batches FROM test_stats WHERE test_key=?", (tk,)).fetchone()
+    st = c.execute("SELECT tree_rev, dup_batches, id_conflicts FROM test_stats WHERE test_key=?", (tk,)).fetchone()
+    tree_ack = r.get("tree", {}).get("acknowledged_revision") or 0
+    revs = {x[0] for x in c.execute("SELECT revision FROM tree_revisions WHERE test_key=? AND revision<=?", (tk, tree_ack))}
+    tree_gaps = sorted(set(range(1, tree_ack + 1)) - revs)
     lost = sorted(acked - normal)
     phantom = sorted(normal - sent)
     res = {
         "test_id": test_id,
+        "run": {"state": r.get("stats", {}).get("state"), "finish_reason": r.get("stats", {}).get("finish_reason")},
         "batches": {"sent": len(sent), "acked_by_us": len(acked), "stored": len(normal),
                     "acked_but_missing": len(lost), "acked_but_missing_ids": lost[:50],
                     "stored_never_sent": len(phantom),
                     "stored_without_ack": len(normal & (sent - acked))},
-        "objects": {"generator_acknowledged": r.get("stats", {}).get("acknowledged_objects"),
-                    "rows_in_store": obj_rows, "sum_of_stored_batches": stored_objs},
+        "objects": {"generator_acknowledged": gen_acked_objs, "stored_in_acked_batches": acked_objs_in_store,
+                    "rows_in_store": obj_rows, "sum_of_stored_batches": stored_objs,
+                    "identical_resends_kept_once": st[2]},
         "faults": {"sent": len(f_sent), "rejected": len(f_rej), "acked": len(f_ack),
                    "stored": len(faults_stored)},
         "duplicates": {"sent": len(d_sent), "acked": len(d_ack), "absorbed_by_store": st[1]},
         "tree": {"generator_attempted": r.get("tree", {}).get("attempted_revision"),
-                 "generator_acknowledged": r.get("tree", {}).get("acknowledged_revision"), "stored": st[0]},
+                 "generator_acknowledged": tree_ack, "stored_max": st[0], "gaps_in_acked_range": tree_gaps[:50]},
     }
-    res["ok"] = (not lost and not phantom and not faults_stored and len(f_ack) == 0
-                 and obj_rows == stored_objs and res["tree"]["stored"] >= (res["tree"]["generator_acknowledged"] or 0))
+    # integrity: nothing acknowledged is missing, nothing wrong was stored, counts add up
+    res["integrity_ok"] = (not lost and not phantom and not faults_stored and len(f_ack) == 0
+                           and obj_rows + st[2] == stored_objs
+                           and (gen_acked_objs is None or acked_objs_in_store == gen_acked_objs)
+                           and not tree_gaps)
+    # exercise: every injected fault was rejected, every duplicate acknowledged, run finished cleanly
+    res["exercise_complete"] = (len(f_rej) == len(f_sent) and len(d_ack) == len(d_sent)
+                                and res["run"]["state"] == "completed")
+    res["ok"] = res["integrity_ok"]
     return res

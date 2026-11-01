@@ -3,7 +3,8 @@
 Ingest contract: the HTTP handler waits until the writer has COMMITTED the
 message (fsync'd WAL) before answering 2xx. The writer drains everything that
 queued up while the previous commit was running into one transaction
-("group commit"), so one fsync covers many messages.
+("group commit"), so one fsync covers many messages. Each message runs inside
+its own SAVEPOINT, so one bad message is rolled back without touching the rest.
 """
 import logging
 import os
@@ -27,7 +28,7 @@ CREATE TABLE IF NOT EXISTS test_stats(
   dup_tree INTEGER DEFAULT 0, first_ms INTEGER, last_ms INTEGER);
 CREATE TABLE IF NOT EXISTS batches(
   test_key INTEGER, batch_id INTEGER, n INTEGER, tree_rev INTEGER, bytes INTEGER,
-  committed_ms INTEGER, PRIMARY KEY(test_key, batch_id)) WITHOUT ROWID;
+  committed_ms INTEGER, digest BLOB, PRIMARY KEY(test_key, batch_id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS batches_time ON batches(test_key, committed_ms);
 CREATE TABLE IF NOT EXISTS objects(
   test_key INTEGER, seq INTEGER, batch_id INTEGER, type_id INTEGER, name TEXT,
@@ -39,14 +40,17 @@ CREATE TABLE IF NOT EXISTS types(
   test_key INTEGER, type_id INTEGER, parent_id INTEGER, name TEXT,
   created_rev INTEGER, updated_rev INTEGER, PRIMARY KEY(test_key, type_id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS tree_revisions(
-  test_key INTEGER, revision INTEGER, n_changes INTEGER, committed_ms INTEGER,
+  test_key INTEGER, revision INTEGER, n_changes INTEGER, committed_ms INTEGER, digest BLOB,
   PRIMARY KEY(test_key, revision)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS tree_changes(
   test_key INTEGER, revision INTEGER, idx INTEGER, op TEXT, type_id INTEGER,
-  parent_id INTEGER, name TEXT, old_parent INTEGER, old_name TEXT,
+  parent_id INTEGER, name TEXT, old_parent INTEGER, old_name TEXT, applied INTEGER DEFAULT 1,
   PRIMARY KEY(test_key, revision, idx)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS type_counts(
   test_key INTEGER, type_id INTEGER, n INTEGER, PRIMARY KEY(test_key, type_id)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS frames(
+  test_key INTEGER, frame_kind TEXT, frame_id TEXT, unit TEXT, n INTEGER,
+  PRIMARY KEY(test_key, frame_kind, frame_id, unit)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS fields(
   test_key INTEGER, type_id INTEGER, name TEXT, json_type TEXT, first_seq INTEGER,
   first_batch INTEGER, first_ms INTEGER, PRIMARY KEY(test_key, type_id, name)) WITHOUT ROWID;
@@ -54,8 +58,18 @@ CREATE TABLE IF NOT EXISTS rejects(
   id INTEGER PRIMARY KEY, test_id TEXT, kind TEXT, batch_id INTEGER, revision INTEGER,
   code INTEGER, reason TEXT, bytes INTEGER, received_ms INTEGER, sample TEXT);
 """
+# columns added after the first release; ALTER is a no-op error on fresh databases
+MIGRATIONS = [
+    "ALTER TABLE batches ADD COLUMN digest BLOB",
+    "ALTER TABLE tree_revisions ADD COLUMN digest BLOB",
+    "ALTER TABLE tree_changes ADD COLUMN applied INTEGER DEFAULT 1",
+]
 
 TREE_OPS = {"create", "rename", "move", "update", "delete"}
+OBJ_COLS = "type_id, name, ts_ms, frame_kind, frame_id, unit, x, y, z, attrs, batch_id"
+
+MAX_DB_BYTES = int(float(os.environ.get("MAX_DB_GIB", "17")) * (1 << 30))      # of the 20 GiB volume
+MIN_FREE_BYTES = int(float(os.environ.get("MIN_FREE_GIB", "1")) * (1 << 30))   # headroom for WAL/checkpoint
 
 
 def now_ms():
@@ -77,14 +91,24 @@ def json_type(v):
     return "null"
 
 
-class Job:
-    __slots__ = ("kind", "msg", "nbytes", "cost", "done", "code", "reason", "sample", "t0")
+class Conflict(Exception):
+    """Message must not be stored; rolled back to its savepoint and rejected."""
 
-    def __init__(self, kind, msg, nbytes, cost=1):
+    def __init__(self, code, reason):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+class Job:
+    __slots__ = ("kind", "msg", "nbytes", "cost", "done", "code", "reason", "sample", "t0", "digest")
+
+    def __init__(self, kind, msg, nbytes, cost=1, digest=None):
         self.kind = kind
         self.msg = msg
         self.nbytes = nbytes
         self.cost = cost
+        self.digest = digest
         self.done = None
         self.code = 0
         self.reason = ""
@@ -101,11 +125,17 @@ class Store:
         self.q = queue.Queue(maxsize=queue_max)
         self.conn = self._open(path)
         self.conn.executescript(SCHEMA)
+        for sql in MIGRATIONS:
+            try:
+                self.conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
         self._local = threading.local()
         self.metrics = Counter()
         self.last_commit_ms = 0.0
         self.max_commit_ms = 0.0
         self.ack_lat = []  # recent ack latencies (ms), bounded
+        self.disk = {"db_bytes": 0, "free_bytes": None, "full": False, "checked": 0.0}
         self._load_memory()
         self.thread = threading.Thread(target=self._run, name="writer", daemon=True)
         self.thread.start()
@@ -140,14 +170,33 @@ class Store:
         c = self.conn
         self.tests = {tid: k for k, tid in c.execute("SELECT test_key, test_id FROM tests")}
         self.test_ids = {k: tid for tid, k in self.tests.items()}
-        trees = defaultdict(dict)
-        for tk, tid, pid, name in c.execute("SELECT test_key, type_id, parent_id, name FROM types"):
+        trees, revs = defaultdict(dict), defaultdict(dict)
+        for tk, tid, pid, name, urev in c.execute("SELECT test_key, type_id, parent_id, name, updated_rev FROM types"):
             trees[tk][tid] = (pid, name)
-        self.trees = dict(trees)  # values are replaced, never mutated in place
+            revs[tk][tid] = urev
+        self.trees = dict(trees)      # values are replaced, never mutated in place
+        self.node_revs = dict(revs)   # revision that last changed each node
         fields = defaultdict(set)
         for tk, tid, name in c.execute("SELECT test_key, type_id, name FROM fields"):
             fields[(tk, tid)].add(name)
         self.fields = fields
+
+    # ---------- disk budget ----------
+    def _check_disk(self):
+        now = time.monotonic()
+        if now - self.disk["checked"] < 1.0:
+            return self.disk["full"]
+        db = sum(os.path.getsize(self.path + s) for s in ("", "-wal", "-shm") if os.path.exists(self.path + s))
+        try:
+            st = os.statvfs(os.path.dirname(self.path) or ".")
+            free = st.f_bavail * st.f_frsize
+        except (AttributeError, OSError):
+            free = None
+        full = db > MAX_DB_BYTES or (free is not None and free < MIN_FREE_BYTES)
+        if full and not self.disk["full"]:
+            log.error("disk budget reached (db=%s free=%s): refusing new writes with 507", db, free)
+        self.disk.update(db_bytes=db, free_bytes=free, full=full, checked=now)
+        return full
 
     # ---------- writer ----------
     def submit_nowait(self, job):
@@ -180,29 +229,31 @@ class Store:
     def _commit_group(self, group):
         t0 = time.perf_counter()
         c = self.conn
-        results = None
-        try:
-            self._reset_acc()
-            c.execute("BEGIN IMMEDIATE")
-            results = [self._apply(j) for j in group]
-            self._flush_acc()
-            c.execute("COMMIT")
-        except Exception:
-            log.exception("group commit failed; retrying messages one by one")
-            self._safe_rollback()
-            results = []
-            for j in group:
-                try:
-                    self._reset_acc()
-                    c.execute("BEGIN IMMEDIATE")
-                    r = self._apply(j)
-                    self._flush_acc()
-                    c.execute("COMMIT")
-                except Exception as e:  # message is NOT stored -> 500, generator retries
-                    log.exception("message failed")
-                    self._safe_rollback()
-                    r = (500, f"storage error: {e}")
-                results.append(r)
+        if self._check_disk():  # never acknowledge what we may not be able to keep
+            results = [(507, "storage budget reached") for _ in group]
+        else:
+            try:
+                self._reset_acc()
+                c.execute("BEGIN IMMEDIATE")
+                results = [self._apply(j) for j in group]
+                self._flush_acc()
+                c.execute("COMMIT")
+            except Exception:
+                log.exception("group commit failed; retrying messages one by one")
+                self._safe_rollback()
+                results = []
+                for j in group:
+                    try:
+                        self._reset_acc()
+                        c.execute("BEGIN IMMEDIATE")
+                        r = self._apply(j)
+                        self._flush_acc()
+                        c.execute("COMMIT")
+                    except Exception as e:  # message is NOT stored -> 500, generator retries
+                        log.exception("message failed")
+                        self._safe_rollback()
+                        r = (500, f"storage error: {e}")
+                    results.append(r)
         dt = (time.perf_counter() - t0) * 1000
         self.last_commit_ms = dt
         self.max_commit_ms = max(self.max_commit_ms, dt)
@@ -228,6 +279,7 @@ class Store:
     def _reset_acc(self):
         self.acc_stats = defaultdict(Counter)
         self.acc_types = Counter()
+        self.acc_frames = Counter()
         self.acc_rev = {}
 
     def _flush_acc(self):
@@ -244,6 +296,11 @@ class Store:
             c.executemany(
                 "INSERT INTO type_counts VALUES(?,?,?) ON CONFLICT(test_key,type_id) DO UPDATE SET n=n+excluded.n",
                 [(tk, tid, n) for (tk, tid), n in self.acc_types.items()])
+        if self.acc_frames:
+            c.executemany(
+                "INSERT INTO frames VALUES(?,?,?,?,?) ON CONFLICT(test_key,frame_kind,frame_id,unit)"
+                " DO UPDATE SET n=n+excluded.n",
+                [(tk, fk, fi, un, n) for (tk, fk, fi, un), n in self.acc_frames.items()])
         for tk, rev in self.acc_rev.items():
             c.execute("UPDATE test_stats SET tree_rev=MAX(tree_rev, ?) WHERE test_key=?", (rev, tk))
 
@@ -259,11 +316,25 @@ class Store:
 
     # ---------- apply one message inside the open transaction ----------
     def _apply(self, j):
-        if j.kind == "objects":
-            return self._apply_objects(j)
-        if j.kind == "types":
-            return self._apply_types(j)
-        return self._reject(j, j.code, j.reason)
+        if j.kind not in ("objects", "types"):
+            return self._reject(j, j.code, j.reason)
+        c = self.conn
+        tk = self._test_key(j.msg["test_id"])  # outside the savepoint: memory and row stay in sync
+        fn = self._apply_objects if j.kind == "objects" else self._apply_types
+        c.execute("SAVEPOINT msg")
+        try:
+            try:
+                r = fn(j, tk, False)
+            except sqlite3.IntegrityError:  # an object id already exists: decide row by row
+                c.execute("ROLLBACK TO msg")
+                r = fn(j, tk, True)
+            c.execute("RELEASE msg")
+            return r
+        except Conflict as e:
+            c.execute("ROLLBACK TO msg")
+            c.execute("RELEASE msg")
+            j.sample = orjson.dumps(j.msg).decode()[:4000]
+            return self._reject(j, e.code, e.reason)
 
     def _reject(self, j, code, reason):
         m = j.msg if isinstance(j.msg, dict) else {}
@@ -279,22 +350,23 @@ class Store:
         self.metrics["rejected"] += 1
         return code, reason
 
-    def _apply_objects(self, j):
+    def _apply_objects(self, j, tk, slow):
         c = self.conn
         m = j.msg
-        tk = self._test_key(m["test_id"])
         bid = m["batch_id"]
         objs = m["objects"]
         st = self.acc_stats[tk]
-        if c.execute("SELECT 1 FROM batches WHERE test_key=? AND batch_id=?", (tk, bid)).fetchone():
+        row = c.execute("SELECT digest FROM batches WHERE test_key=? AND batch_id=?", (tk, bid)).fetchone()
+        if row:
+            if row[0] is not None and j.digest is not None and row[0] != j.digest:
+                raise Conflict(409, f"batch {bid} was already stored with different content")
             st["dup_batches"] += 1
             st["dup_objects"] += len(objs)
             return 200, "duplicate"
         tree = self.trees.get(tk, {})
         missing = sorted({o["type_id"] for o in objs if o["type_id"] not in tree})
         if missing:
-            j.sample = orjson.dumps(m).decode()[:4000]
-            return self._reject(j, 422, f"unknown type_id {missing[:5]} (tree revision {m['tree_revision']})")
+            raise Conflict(422, f"unknown type_id {missing[:5]} (tree revision {m['tree_revision']})")
         rows = []
         dumps = orjson.dumps
         for o in objs:
@@ -306,21 +378,36 @@ class Store:
                 x, y, z = p["x"], p["y"], p["z"]
             rows.append((tk, o["sequence"], bid, o["type_id"], o["name"], o["timestamp_ms"],
                          fk, fi, un, x, y, z, dumps(o["attributes"])))
-        before = c.total_changes
-        c.executemany("INSERT OR IGNORE INTO objects VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-        inserted = c.total_changes - before
+        ins = "INSERT INTO objects VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        if not slow:
+            c.executemany(ins, rows)  # IntegrityError -> caller retries with slow=True
+            accepted = list(zip(objs, rows))
+        else:
+            accepted = []
+            for o, r in zip(objs, rows):
+                old = c.execute(f"SELECT {OBJ_COLS} FROM objects WHERE test_key=? AND seq=?", (tk, r[1])).fetchone()
+                if old is None:
+                    c.execute(ins, r)
+                    accepted.append((o, r))
+                    continue
+                same = (tuple(old[:9]) == r[3:12] and orjson.loads(old[9]) == o["attributes"])
+                if not same:
+                    raise Conflict(409, f"object {o['id']} already stored by batch {old[10]} with different content")
+                st["id_conflicts"] += 1  # identical re-send under a new batch id: keep one copy
         t = now_ms()
-        c.execute("INSERT INTO batches VALUES(?,?,?,?,?,?)", (tk, bid, len(objs), m["tree_revision"], j.nbytes, t))
-        st["objects"] += inserted
-        st["id_conflicts"] += len(rows) - inserted
+        c.execute("INSERT INTO batches VALUES(?,?,?,?,?,?,?)",
+                  (tk, bid, len(objs), m["tree_revision"], j.nbytes, t, j.digest))
+        # statistics and field discovery only for objects actually stored by this message
+        st["objects"] += len(accepted)
         st["batches"] += 1
         st["bytes"] += j.nbytes
-        acc_types = self.acc_types
-        fields = self.fields
+        acc_types, acc_frames, fields = self.acc_types, self.acc_frames, self.fields
         new_fields = []
-        for o in objs:
+        for o, r in accepted:
             tid = o["type_id"]
             acc_types[(tk, tid)] += 1
+            if r[6] is not None:
+                acc_frames[(tk, r[6], r[7], r[8])] += 1
             known = fields[(tk, tid)]
             a = o["attributes"]
             if len(a) > len(known) or not known.issuperset(a):
@@ -332,15 +419,18 @@ class Store:
             c.executemany("INSERT OR IGNORE INTO fields VALUES(?,?,?,?,?,?,?)", new_fields)
         return 200, "stored"
 
-    def _apply_types(self, j):
+    def _apply_types(self, j, tk, slow):
         c = self.conn
         m = j.msg
-        tk = self._test_key(m["test_id"])
         rev = m["revision"]
-        if c.execute("SELECT 1 FROM tree_revisions WHERE test_key=? AND revision=?", (tk, rev)).fetchone():
+        row = c.execute("SELECT digest FROM tree_revisions WHERE test_key=? AND revision=?", (tk, rev)).fetchone()
+        if row:
+            if row[0] is not None and j.digest is not None and row[0] != j.digest:
+                raise Conflict(409, f"tree revision {rev} was already stored with different content")
             self.acc_stats[tk]["dup_tree"] += 1
             return 200, "duplicate"
         tree = dict(self.trees.get(tk, {}))
+        nrev = dict(self.node_revs.get(tk, {}))
         change_rows = []
         for i, ch in enumerate(m["changes"]):
             op = ch["op"]
@@ -348,27 +438,35 @@ class Store:
             tid, pid, name = n["type_id"], n["parent_id"], n["name"]
             old = tree.get(tid)
             if op not in TREE_OPS:
-                return self._tree_reject(j, f"changes[{i}]: unknown op {op!r}")
+                raise Conflict(422, f"changes[{i}]: unknown op {op!r}")
+            if old is not None and nrev.get(tid, 0) > rev:
+                # a newer revision already set this node: keep the newer state, record the stale change
+                change_rows.append((tk, rev, i, op, tid, pid, name, old[0], old[1], 0))
+                continue
             if op == "create" and old is not None:
-                return self._tree_reject(j, f"changes[{i}]: type {tid} already exists")
+                raise Conflict(422, f"changes[{i}]: type {tid} already exists")
             if op != "create" and old is None:
-                return self._tree_reject(j, f"changes[{i}]: type {tid} does not exist")
+                raise Conflict(422, f"changes[{i}]: type {tid} does not exist")
             if op == "delete":
                 if any(p == tid for p, _ in tree.values()):
-                    return self._tree_reject(j, f"changes[{i}]: type {tid} still has children")
+                    raise Conflict(422, f"changes[{i}]: type {tid} still has children")
                 del tree[tid]
+                nrev.pop(tid, None)
             else:
                 if pid != 0 and pid not in tree:
-                    return self._tree_reject(j, f"changes[{i}]: parent {pid} does not exist")
+                    raise Conflict(422, f"changes[{i}]: parent {pid} does not exist")
                 a = pid
                 while a:
                     if a == tid:
-                        return self._tree_reject(j, f"changes[{i}]: move of {tid} under {pid} creates a cycle")
+                        raise Conflict(422, f"changes[{i}]: move of {tid} under {pid} creates a cycle")
                     a = tree[a][0]
                 tree[tid] = (pid, name)
+                nrev[tid] = rev
             change_rows.append((tk, rev, i, op, tid, pid, name,
-                                old[0] if old else None, old[1] if old else None))
-        for (_, _, _, op, tid, pid, name, _, _) in change_rows:
+                                old[0] if old else None, old[1] if old else None, 1))
+        for (_, _, _, op, tid, pid, name, _, _, applied) in change_rows:
+            if not applied:
+                continue
             if op == "delete":
                 c.execute("DELETE FROM types WHERE test_key=? AND type_id=?", (tk, tid))
             else:
@@ -376,13 +474,12 @@ class Store:
                     "INSERT INTO types VALUES(?,?,?,?,?,?) ON CONFLICT(test_key,type_id) DO UPDATE SET"
                     " parent_id=excluded.parent_id, name=excluded.name, updated_rev=excluded.updated_rev",
                     (tk, tid, pid, name, rev, rev))
-        c.executemany("INSERT INTO tree_changes VALUES(?,?,?,?,?,?,?,?,?)", change_rows)
-        c.execute("INSERT INTO tree_revisions VALUES(?,?,?,?)", (tk, rev, len(change_rows), now_ms()))
-        self.trees[tk] = tree  # replace atomically; readers never see a half-applied tree
+        c.executemany("INSERT INTO tree_changes VALUES(?,?,?,?,?,?,?,?,?,?)", change_rows)
+        c.execute("INSERT INTO tree_revisions VALUES(?,?,?,?,?)", (tk, rev, len(change_rows), now_ms(), j.digest))
+        # replace atomically; readers never see a half-applied tree. On a later group
+        # failure _safe_rollback() reloads both from the database.
+        self.trees[tk] = tree
+        self.node_revs[tk] = nrev
         self.acc_rev[tk] = max(rev, self.acc_rev.get(tk, 0))
         self.acc_stats[tk]["bytes"] += j.nbytes
         return 200, "stored"
-
-    def _tree_reject(self, j, reason):
-        j.sample = orjson.dumps(j.msg).decode()[:4000]
-        return self._reject(j, 422, reason)

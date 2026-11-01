@@ -13,6 +13,9 @@ services:
     mem_limit: 4g
     memswap_limit: 4g
     restart: unless-stopped
+    logging:                 # bounded logs: they count against the same disk budget
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
     stop_grace_period: 30s
 
 volumes:

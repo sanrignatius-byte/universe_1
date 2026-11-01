@@ -39,7 +39,7 @@ async function loadTests() {
     S.test = sel.value || null;
   } catch (e) { /* no data yet */ }
 }
-$("#test").onchange = () => { S.test = $("#test").value; S.tree = null; S.sel = null; refresh(true); };
+$("#test").onchange = () => { S.test = $("#test").value; S.tree = null; S.sel = null; S.frame = null; refresh(true); };
 
 // ---------------------------------------------------------------- tree helpers
 async function loadTree(force) {
@@ -202,12 +202,13 @@ $("#modal").onclick = (e) => { if (e.target.id === "modal") $("#modal").classLis
 // ---------------------------------------------------------------- map
 async function renderMap() {
   await loadTree(false);
-  const frame = $("#frame").value || "galactic";
-  const d = await api("/api/map?" + qs({ test: S.test, frame, type: S.sel, limit: 20000 }));
-  const fs = $("#frame");
-  if (fs.options.length !== d.frames.length) {
-    fs.innerHTML = d.frames.map((f) => `<option ${f === frame ? "selected" : ""}>${esc(f)}</option>`).join("");
-  }
+  // one reference frame at a time: kind + frame_id + unit (local frames have no shared origin)
+  const cur = S.frame || {};
+  const d = await api("/api/map?" + qs({ test: S.test, kind: cur.frame_kind, frame_id: cur.frame_id, unit: cur.unit, type: S.sel, limit: 20000 }));
+  S.frames = d.frames;
+  S.frame = d.frame;
+  const key = (f) => f ? `${f.frame_kind}|${f.frame_id}|${f.unit}` : "";
+  $("#frame").innerHTML = d.frames.map((f, i) => `<option value="${i}" ${key(f) === key(d.frame) ? "selected" : ""}>${esc(f.frame_kind)} · ${esc(f.frame_id)} · ${esc(f.unit)}（${fmt(f.n)}）</option>`).join("");
   S.mapPts = d.points;
   drawMap();
   $("#legend").innerHTML = S.tree.tops.map((t) => `<span><i style="background:${S.tree.color.get(t)}"></i>${esc(S.tree.by.get(t).name)}</span>`).join("");
@@ -229,7 +230,8 @@ function drawMap() {
   for (const p of pts) { const [X, Y] = S.proj(p); g.fillStyle = typeColor(p[1]); g.globalAlpha = 0.7; g.fillRect(X - 1, Y - 1, 2.2, 2.2); }
   g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
   g.fillStyle = "#8a97b6"; g.font = "12px sans-serif";
-  g.fillText(`${fmt(pts.length)} 个对象 · x ∈ [${fmt(x0)}, ${fmt(x1)}]`, 12, h - 12);
+  const f = S.frame || {};
+  g.fillText(`${f.frame_kind} · ${f.frame_id} · 单位 ${f.unit} · ${fmt(pts.length)} 个对象 · x ∈ [${fmt(x0)}, ${fmt(x1)}] ${f.unit}`, 12, h - 12);
 }
 $("#sky").onclick = (e) => {
   if (!S.proj) return;
@@ -238,7 +240,7 @@ $("#sky").onclick = (e) => {
   for (const p of S.mapPts) { const [X, Y] = S.proj(p); const d = (X - mx) ** 2 + (Y - my) ** 2; if (d < bd) { bd = d; best = p; } }
   if (best) showObject(`${S.test}-${best[0]}`);
 };
-$("#frame").onchange = renderMap;
+$("#frame").onchange = () => { S.frame = S.frames[Number($("#frame").value)]; renderMap(); };
 $("#proj").onchange = drawMap;
 
 // ---------------------------------------------------------------- evolution
@@ -275,15 +277,18 @@ $("#receipt").onchange = async (e) => {
     const r = await api("/api/reconcile", { method: "POST", headers: { "Content-Type": "application/json" }, body: await f.text() });
     const row = (k, v, good) => `<div class="recon-row"><span>${k}</span><span class="badge ${good === undefined ? "" : good ? "ok" : "bad"}">${esc(v)}</span></div>`;
     const b = r.batches, o = r.objects, fa = r.faults, du = r.duplicates, t = r.tree;
-    $("#recon").innerHTML = `<h3>${r.ok ? '<span class="badge ok">全部一致</span>' : '<span class="badge bad">发现不一致</span>'} ${esc(r.test_id)}</h3>` +
+    $("#recon").innerHTML = `<h3>${esc(r.test_id)} ` +
+      (r.integrity_ok ? '<span class="badge ok">数据完整：确认的都在、错的没进</span>' : '<span class="badge bad">数据不一致</span>') + " " +
+      (r.exercise_complete ? '<span class="badge ok">演练完整</span>' : `<span class="badge">演练未完整：${esc(r.run.state)} / ${esc(r.run.finish_reason)}</span>`) + `</h3>` +
       row("发生器已发送批次", fmt(b.sent)) + row("我们确认（2xx）的批次", fmt(b.acked_by_us)) + row("实际落盘批次", fmt(b.stored)) +
       row("已确认但未落盘（丢失）", fmt(b.acked_but_missing), b.acked_but_missing === 0) +
       row("落盘但从未发送（幻影）", fmt(b.stored_never_sent), b.stored_never_sent === 0) +
       row("落盘但确认未送达（可接受）", fmt(b.stored_without_ack)) +
-      row("对象：发生器确认 / 库中行数", `${fmt(o.generator_acknowledged)} / ${fmt(o.rows_in_store)}`, o.rows_in_store === o.sum_of_stored_batches) +
+      row("对象：发生器确认 / 已确认批次中落盘", `${fmt(o.generator_acknowledged)} / ${fmt(o.stored_in_acked_batches)}`, o.generator_acknowledged == null || o.generator_acknowledged === o.stored_in_acked_batches) +
+      row("对象：库中行数 / 落盘批次合计", `${fmt(o.rows_in_store)} / ${fmt(o.sum_of_stored_batches)}`, o.rows_in_store + o.identical_resends_kept_once === o.sum_of_stored_batches) +
       row("故障消息：发送 / 拒收 / 误收", `${fa.sent} / ${fa.rejected} / ${fa.acked}`, fa.acked === 0 && fa.stored === 0) +
       row("重复批次：发送 / 吸收", `${du.sent} / ${du.absorbed_by_store}`) +
-      row("类型树修订：发生器确认 / 已存", `${t.generator_acknowledged} / ${t.stored}`, t.stored >= t.generator_acknowledged);
+      row("类型树修订：发生器确认 / 已存最大 / 缺口", `${t.generator_acknowledged} / ${t.stored_max} / ${t.gaps_in_acked_range.length}`, t.gaps_in_acked_range.length === 0);
   } catch (err) { $("#recon").innerHTML = `<p class="badge bad">${esc(err.message)}</p>`; }
 };
 
