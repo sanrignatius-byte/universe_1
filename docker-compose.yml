@@ -1,0 +1,17 @@
+services:
+  observatory:
+    build: .
+    image: cosmos-observatory:latest
+    container_name: cosmos-observatory
+    ports:
+      - "8000:8000"          # generator posts to http://host.docker.internal:8000/ingest
+    volumes:
+      - cosmos-data:/data    # SQLite database + WAL (persistent, not a host bind mount)
+    cpus: 4
+    mem_limit: 4g
+    memswap_limit: 4g
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  cosmos-data: {}
