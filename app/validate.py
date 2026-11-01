@@ -10,7 +10,7 @@ MAX_SEQUENCE = 1 << 40  # object keys are (test_key << 40) | sequence
 
 
 def _int(v):
-    return type(v) is int
+    return type(v) is int and -(1 << 63) <= v < (1 << 63)
 
 
 def _num(v):
@@ -28,7 +28,7 @@ def check_objects(m, h_test, h_batch):
         return "batch_id missing or not a non-negative integer"
     if h_batch is not None and h_batch != str(bid):
         return "header X-Flightgen-Batch-Id does not match body"
-    if not _int(m.get("tree_revision")):
+    if not _int(m.get("tree_revision")) or m["tree_revision"] < 0:
         return "tree_revision missing or not integer"
     objs = m.get("objects")
     if type(objs) is not list or not objs:
@@ -51,7 +51,7 @@ def check_objects(m, h_test, h_batch):
         name = o.get("name")
         if type(name) is not str or not name:
             return f"objects[{i}].name missing"
-        if not _int(o.get("timestamp_ms")):
+        if not _int(o.get("timestamp_ms")) or abs(o["timestamp_ms"]) > 8640000000000000:
             return f"objects[{i}].timestamp_ms missing or not integer"
         if "position" not in o:
             return f"objects[{i}].position missing"
@@ -63,8 +63,8 @@ def check_objects(m, h_test, h_batch):
                 if not _num(p.get(c)):
                     return f"objects[{i}].position.{c} missing or not numeric"
             for c in ("frame_kind", "frame_id", "unit"):
-                if c in p and type(p[c]) is not str:
-                    return f"objects[{i}].position.{c} must be a string"
+                if type(p.get(c)) is not str or not p[c]:
+                    return f"objects[{i}].position.{c} must be a non-empty string"
         if type(o.get("attributes")) is not dict:
             return f"objects[{i}].attributes must be an object"
     return None

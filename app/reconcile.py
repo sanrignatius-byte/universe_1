@@ -107,6 +107,8 @@ def reconcile_receipt(store, r):
     FS, FA, FR, DS, DA, FST = (_bits(x) for x in (fs_b, fa_b, fr_b, ds_b, da_b, fstored))
     lost = A & ~N
     phantom = N & ~S
+    unaccounted = S & ~A & ~N
+    receipt_consistent = not (A & ~S or DA & ~DS or DA & ~A) and tree_att >= tree_ack
     faults_stored = FST.bit_count() + beyond_faults
 
     obj_rows = c.execute("SELECT COUNT(*) FROM objects WHERE test_key=?", (tk,)).fetchone()[0]
@@ -134,6 +136,8 @@ def reconcile_receipt(store, r):
         "batches": {"sent": S.bit_count(), "acked_by_us": A.bit_count(), "stored": stored_normal,
                     "acked_but_missing": lost.bit_count(), "acked_but_missing_ids": _first(lost),
                     "stored_never_sent": phantom.bit_count() + beyond_sent,
+                    "sent_unacknowledged": (S & ~A).bit_count(),
+                    "sent_unaccounted": unaccounted.bit_count(),
                     "stored_without_ack": (N & S & ~A).bit_count()},
         "objects": {"generator_acknowledged": gen_acked_objs, "stored_in_acked_batches": acked_objs_in_store,
                     "rows_in_store": obj_rows, "sum_of_stored_batches": stored_objs,
@@ -148,8 +152,10 @@ def reconcile_receipt(store, r):
     # integrity: nothing acknowledged is missing, nothing wrong was stored, counts add up
     res["integrity_ok"] = (lost == 0 and res["batches"]["stored_never_sent"] == 0 and faults_stored == 0
                            and FA == 0 and obj_rows + st[2] == stored_objs
-                           and acked_objs_in_store == gen_acked_objs and gaps == 0)
+                           and acked_objs_in_store == gen_acked_objs and gaps == 0 and receipt_consistent)
     # exercise: exactly the injected faults were rejected, every duplicate acknowledged, clean finish
-    res["exercise_complete"] = FR == FS and FA == 0 and DA == DS and state == "completed"
+    res["exercise_complete"] = (res["integrity_ok"] and unaccounted == 0 and FR == FS and FA == 0
+                                and DA == DS and st[1] >= DA.bit_count() and state == "completed")
+    res["verification_scope"] = "batch presence and object counts; receipt supplies no content hashes"
     res["ok"] = res["integrity_ok"]
     return res

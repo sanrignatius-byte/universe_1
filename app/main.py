@@ -40,6 +40,46 @@ async def lifespan(app):
 app = FastAPI(title="Cosmos Observatory", default_response_class=ORJSONResponse, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
+_request_cost = 0
+_request_count = 0
+
+
+@app.middleware("http")
+async def admit_bodies(request, call_next):
+    """Bound active parsing/queued requests by a conservative raw-body cost estimate."""
+    global _request_cost, _request_count
+    if request.method != "POST" or request.url.path not in ("/ingest", "/api/reconcile"):
+        return await call_next(request)
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        return _resp(415, "application/json required")
+    try:
+        length = int(request.headers.get("content-length", MAX_BODY))
+    except ValueError:
+        return _resp(400, "invalid content-length")
+    if length < 0 or length > MAX_BODY:
+        return _resp(413, "too large")
+    cost = length * 8 + 65536
+    if _request_count >= 64 or _request_cost + cost > 768 * 1024 * 1024:
+        return _resp(503, "request memory budget reached")
+    _request_cost += cost
+    _request_count += 1
+    try:
+        return await call_next(request)
+    finally:
+        _request_cost -= cost
+        _request_count -= 1
+
+
+async def _read_body(request, maximum):
+    body = bytearray()
+    declared = request.headers.get("content-length")
+    limit = min(maximum, int(declared)) if declared is not None else maximum
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise HTTPException(413, "body exceeds limit")
+        body.extend(chunk)
+    return body
+
 
 def _set(fut, v):
     if not fut.done():
@@ -60,7 +100,13 @@ async def _submit(job):
                 store.metrics["http_503"] += 1
                 return 503, "busy"
             await asyncio.sleep(0.005)
-    return await fut
+        except RuntimeError:
+            return 503, "writer unavailable"
+    while not fut.done():
+        done, _ = await asyncio.wait([fut], timeout=1)
+        if not done and not store.thread.is_alive():
+            return 503, "writer unavailable"
+    return fut.result()
 
 
 def _resp(code, detail):
@@ -69,7 +115,7 @@ def _resp(code, detail):
 
 @app.post("/ingest")
 async def ingest(request: Request):
-    body = await request.body()
+    body = await _read_body(request, MAX_BODY)
     h = request.headers
     if len(body) > MAX_BODY:
         return _resp(413, "too large")
@@ -88,13 +134,17 @@ async def ingest(request: Request):
             elif kind == "types":
                 err = validate.check_types(m, h.get("x-flightgen-test-id"), h.get("x-flightgen-tree-revision"))
             else:
-                err = f"unknown kind {kind!r}"
+                err = f"unknown kind {str(kind)[:100]!r}"
+            if h.get("x-flightgen-kind") is not None and h["x-flightgen-kind"] != kind:
+                err = "header X-Flightgen-Kind does not match body"
+            if kind == "objects" and h.get("x-flightgen-tree-revision") is not None and h["x-flightgen-tree-revision"] != str(m.get("tree_revision")):
+                err = "header X-Flightgen-Tree-Revision does not match body"
     if err:
         j = Job("reject", m, len(body))
         j.code, j.reason, j.sample = code, err, body[:4000].decode("utf-8", "replace")
         code, detail = await _submit(j)
-        if code == 503:
-            return _resp(503, "busy")
+        if code >= 500:
+            return _resp(code, detail)
         return _resp(j.code, err)
     cost = len(m["objects"]) if m["kind"] == "objects" else 1
     # content digest of the canonical (key-sorted) message: a re-send with the same id is
@@ -147,7 +197,9 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "queue": store.q.qsize(), "writer_alive": store.thread.is_alive()}
+    alive = store.thread.is_alive()
+    ok = alive and not store.disk["full"]
+    return ORJSONResponse({"ok": ok, "queue": store.q.qsize(), "writer_alive": alive}, status_code=200 if ok else 503)
 
 
 @app.get("/api/tests")
@@ -350,7 +402,7 @@ MAX_RECEIPT_BYTES = 64 * 1024 * 1024
 @app.post("/api/reconcile")
 async def reconcile(request: Request):
     """Compare a generator receipt with what is durably stored (see app/reconcile.py)."""
-    body = await request.body()
+    body = await _read_body(request, MAX_RECEIPT_BYTES)
     if len(body) > MAX_RECEIPT_BYTES:
         raise HTTPException(413, "receipt too large")
     try:

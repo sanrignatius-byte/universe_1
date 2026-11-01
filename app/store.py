@@ -169,14 +169,18 @@ class Store:
         if d:
             os.makedirs(d, exist_ok=True)
         self.q = queue.Queue(maxsize=queue_max)
+        self._budget_lock = threading.Lock()
+        self._queued_bytes = 0
+        self._queue_budget = 128 * 1024 * 1024
         self.conn = self._open(path)
         self._migrate_v1()
         self.conn.executescript(SCHEMA)
         for sql in MIGRATIONS:
             try:
                 self.conn.execute(sql)
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
         self._local = threading.local()
         self.metrics = Counter()
         self.last_commit_ms = 0.0
@@ -222,8 +226,11 @@ class Store:
         log.warning("migrating %s from schema v1 (attributes inside objects)", self.path)
         c.execute("BEGIN IMMEDIATE")
         try:
+            if c.execute("SELECT 1 FROM objects WHERE seq<0 OR seq>=1099511627776"
+                         " OR test_key<1 OR test_key>=8388608 LIMIT 1").fetchone():
+                raise ValueError("v1 migration refused: object keys exceed packed-key bounds; original data retained")
             c.execute("CREATE TABLE IF NOT EXISTS object_attrs(okey INTEGER PRIMARY KEY, attrs BLOB)")
-            c.execute("INSERT OR IGNORE INTO object_attrs SELECT (test_key << 40) | seq, attrs FROM objects")
+            c.execute("INSERT INTO object_attrs SELECT (test_key << 40) | seq, attrs FROM objects")
             c.execute("CREATE TABLE objects_v2(test_key INTEGER, seq INTEGER, batch_id INTEGER, type_id INTEGER,"
                       " name TEXT, ts_ms INTEGER, frame_kind TEXT, frame_id TEXT, unit TEXT, x REAL, y REAL, z REAL)")
             c.execute("INSERT INTO objects_v2 SELECT test_key, seq, batch_id, type_id, name, ts_ms, frame_kind,"
@@ -272,12 +279,22 @@ class Store:
 
     # ---------- writer ----------
     def submit_nowait(self, job):
-        self.q.put_nowait(job)
+        if not self.thread.is_alive():
+            raise RuntimeError("writer is not running")
+        with self._budget_lock:
+            if self._queued_bytes + job.nbytes > self._queue_budget:
+                raise queue.Full
+            self.q.put_nowait(job)
+            self._queued_bytes += job.nbytes
 
     def close(self):
-        self.q.put(None)
+        if not self.thread.is_alive():
+            self.conn.close()
+            return
+        self.q.put(None, timeout=30)
         self.thread.join(timeout=30)
-        self.conn.close()
+        if not self.thread.is_alive():
+            self.conn.close()
 
     def _run(self):
         while True:
@@ -301,7 +318,13 @@ class Store:
     def _commit_group(self, group):
         t0 = time.perf_counter()
         c = self.conn
-        if self._check_disk():  # never acknowledge what we may not be able to keep
+        try:
+            disk_full = self._check_disk()
+        except Exception:
+            log.exception("disk check failed; refusing writes")
+            self.disk["full"] = True
+            disk_full = True
+        if disk_full:  # never acknowledge what we may not be able to keep
             results = [(507, "storage budget reached") for _ in group]
         else:
             try:
@@ -333,10 +356,15 @@ class Store:
         self.metrics["messages"] += len(group)
         t1 = time.perf_counter()
         for j, (code, detail) in zip(group, results):
+            with self._budget_lock:
+                self._queued_bytes = max(0, self._queued_bytes - j.nbytes)
             self.metrics[f"http_{code}"] += 1
             self.ack_lat.append((t1 - j.t0) * 1000)
             if j.done:
-                j.done(code, detail)
+                try:
+                    j.done(code, detail)
+                except Exception:
+                    log.exception("response callback failed after commit; writer continues")
         if len(self.ack_lat) > 20000:
             self.ack_lat = self.ack_lat[-5000:]
 
@@ -411,12 +439,12 @@ class Store:
     def _reject(self, j, code, reason):
         m = j.msg if isinstance(j.msg, dict) else {}
         test_id = m.get("test_id") if type(m.get("test_id")) is str else None
-        bid = m.get("batch_id") if type(m.get("batch_id")) is int else None
-        rev = m.get("revision") if type(m.get("revision")) is int else None
+        bid = m.get("batch_id") if type(m.get("batch_id")) is int and -(1 << 63) <= m["batch_id"] < (1 << 63) else None
+        rev = m.get("revision") if type(m.get("revision")) is int and -(1 << 63) <= m["revision"] < (1 << 63) else None
         self.conn.execute(
             "INSERT INTO rejects(test_id, kind, batch_id, revision, code, reason, bytes, received_ms, sample)"
             " VALUES(?,?,?,?,?,?,?,?,?)",
-            (test_id, str(m.get("kind")), bid, rev, code, reason, j.nbytes, now_ms(), j.sample[:4000]))
+            (test_id, str(m.get("kind"))[:100], bid, rev, code, reason[:2000], j.nbytes, now_ms(), j.sample[:4000]))
         if test_id:
             self.acc_stats[self._test_key(test_id)]["rejected"] += 1
         self.metrics["rejected"] += 1
@@ -430,6 +458,8 @@ class Store:
         st = self.acc_stats[tk]
         row = c.execute("SELECT digest FROM batches WHERE test_key=? AND batch_id=?", (tk, bid)).fetchone()
         if row:
+            if row[0] is None or j.digest is None:
+                raise Conflict(409, "legacy batch has no verifiable content digest")
             if row[0] is not None and j.digest is not None and row[0] != j.digest:
                 raise Conflict(409, f"batch {bid} was already stored with different content")
             st["dup_batches"] += 1
@@ -504,6 +534,8 @@ class Store:
         rev = m["revision"]
         row = c.execute("SELECT digest FROM tree_revisions WHERE test_key=? AND revision=?", (tk, rev)).fetchone()
         if row:
+            if row[0] is None or j.digest is None:
+                raise Conflict(409, "legacy tree revision has no verifiable content digest")
             if row[0] is not None and j.digest is not None and row[0] != j.digest:
                 raise Conflict(409, f"tree revision {rev} was already stored with different content")
             self.acc_stats[tk]["dup_tree"] += 1

@@ -308,6 +308,96 @@ def restart_rebuilds_memory(st):
     st2.close()
 
 
+@case
+def legacy_null_digests_do_not_ack_conflicting_retries(st):
+    assert send(st, batch(1, [obj(1)]))[0] == 200
+    st.conn.execute("UPDATE batches SET digest=NULL")
+    assert send(st, batch(1, [obj(2)]))[0] == 409
+    st.conn.execute("UPDATE tree_revisions SET digest=NULL")
+    assert send(st, tree(1, [("rename", 2, 1, "changed")]))[0] == 409
+    assert q(st, "SELECT seq FROM objects") == [(1,)]
+
+
+@case
+def migration_rejects_legacy_key_overflow_without_dropping_source(st):
+    st.conn.execute("ALTER TABLE objects ADD COLUMN attrs BLOB")
+    st.conn.execute("INSERT INTO objects(test_key,seq,attrs) VALUES(1,?,?)", (1 << 40, b'{"saved":true}'))
+    try:
+        st._migrate_v1()
+        raise AssertionError("out-of-range legacy key migrated")
+    except ValueError:
+        pass
+    assert q(st, "SELECT attrs FROM objects WHERE seq=?", 1 << 40) == [(b'{"saved":true}',)]
+
+
+@case
+def failing_callback_does_not_kill_writer(st):
+    m = batch(1, [obj(1)])
+    j = Job("objects", m, 100, 1, digest(m))
+    def broken_callback(*args):
+        raise RuntimeError("simulated closed response loop")
+    j.done = broken_callback
+    st.submit_nowait(j)
+    assert send(st, batch(2, [obj(2)]))[0] == 200
+    assert st.thread.is_alive()
+    assert q(st, "SELECT COUNT(*) FROM objects")[0][0] == 2
+
+
+@case
+def disk_probe_failure_rejects_without_killing_writer(st):
+    probe = st._check_disk
+    def broken_probe():
+        raise OSError("simulated stat failure")
+    st._check_disk = broken_probe
+    assert send(st, batch(1, [obj(1)]))[0] == 507
+    assert st.thread.is_alive()
+    st._check_disk = probe
+    st.disk["checked"] = 0
+    assert send(st, batch(1, [obj(1)]))[0] == 200
+
+
+@case
+def queue_byte_budget_applies_before_enqueue(st):
+    import queue
+    st._queue_budget = 1
+    m = batch(1, [obj(1)])
+    try:
+        st.submit_nowait(Job("objects", m, 100, 1, digest(m)))
+        raise AssertionError("byte budget ignored")
+    except queue.Full:
+        pass
+    assert st.q.empty()
+
+
+@case
+def incomplete_normal_run_is_not_complete(st):
+    from app.reconcile import reconcile_receipt
+    assert send(st, batch(0, [obj(1)]))[0] == 200
+    r = reconcile_receipt(st, receipt({0, 1}, {0}, acked_objs=1))
+    assert r["integrity_ok"] and not r["exercise_complete"]
+    assert r["batches"]["sent_unaccounted"] == 1
+
+
+@case
+def stream_limit_stops_before_reading_remaining_chunks(st):
+    import asyncio
+    from fastapi import HTTPException
+    from app.main import _read_body
+    class Body:
+        headers = {}
+        read = 0
+        async def stream(self):
+            for _ in range(100):
+                self.read += 1
+                yield b"123456"
+    body = Body()
+    try:
+        asyncio.run(_read_body(body, 8))
+        raise AssertionError("stream was accepted")
+    except HTTPException as e:
+        assert e.status_code == 413 and body.read == 2
+
+
 failed = 0
 for f in CASES:
     st = fresh()

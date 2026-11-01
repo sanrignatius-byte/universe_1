@@ -209,8 +209,10 @@ bash scripts/fresh-clone-check.sh                                             # 
 
 ### 7.4 复现与平台
 
-- **全新 clone 复现**（`bash scripts/fresh-clone-check.sh`）：从 GitHub 克隆提交 `7d81157` 到新建的临时目录，`docker compose up --build`；回归测试 20/20 通过，一轮发生器（300 对象/s、30 s）对账数据完整 ✓ 演练完整 ✓。之后的提交只改 README。
-- **arm64**（`bash scripts/arm64-check.sh`）：最终代码在 QEMU 下构建 linux/arm64 镜像，`aarch64`、sqlite 3.46.1，orjson / uvloop / httptools / fastapi 均可导入；**20 个回归用例在 arm64 镜像里同样全部通过**。吞吐没有在 arm64 上测过（§8.9）。
+- **全新 clone 复现**（`bash scripts/fresh-clone-check.sh`）：验证对象为提交 `7d81157`，回归测试 20/20 通过，一轮发生器（300 对象/s、30 s）完成批次和数量核对。后续界面及边界修复不在这次 fresh-clone 验证范围内；历史结果不能视为最终提交的全套复验。
+- **arm64**（`bash scripts/arm64-check.sh`）：`7d81157` 在 QEMU 下构建 linux/arm64 镜像，`aarch64`、sqlite 3.46.1，orjson / uvloop / httptools / fastapi 可导入，20 个回归用例通过。后续修复未重新运行 arm64 和吞吐测试。
+
+对账只证明 receipt 描述的批次存在性和对象数量，不验证对象内容；receipt 未提供内容摘要。发送但未确认且未落盘的普通批次会使演练判为未完成。请求采用流式大小限制、并发请求成本预算和队列原始字节预算；成本估计不是 Python 堆内存的硬配额。旧库摘要缺失时拒绝将重发认定为成功重复；迁移键范围不合法时保留旧库并拒绝迁移。脚本隔离、拒收记录保留策略、存储硬配额等审查项仍属于已知限制。
 
 ---
 

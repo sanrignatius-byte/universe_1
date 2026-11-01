@@ -3,7 +3,7 @@ const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmt = (n) => (n == null ? "–" : Number(n).toLocaleString("zh-CN"));
 const bytes = (n) => (n > 1 << 30 ? (n / (1 << 30)).toFixed(2) + " GiB" : (n / (1 << 20)).toFixed(1) + " MiB");
-const ts = (ms) => (ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 19) : "–");
+const ts = (ms) => { if (ms == null) return "–"; const d = new Date(ms); return Number.isFinite(d.getTime()) ? d.toISOString().replace("T", " ").slice(0, 19) : "时间超出显示范围"; };
 const PALETTE = ["#9bc6e9", "#99ceba", "#d9c294", "#d6a3a8", "#b4ade0", "#88cbd3", "#c5a3c7", "#bbcda5", "#d5b19a", "#8bb9dd", "#c3b0e3", "#d2cc9f", "#a7bdcd"];
 
 const S = { test: null, tab: "map", tree: null, sel: null, next: null, mapPts: [], charts: {} };
@@ -673,12 +673,14 @@ $("#receipt").onchange = async (e) => {
     const row = (k, v, good) => `<div class="recon-row"><span>${k}</span><span class="badge ${good === undefined ? "" : good ? "ok" : "bad"}">${esc(v)}</span></div>`;
     const b = r.batches, o = r.objects, fa = r.faults, du = r.duplicates, t = r.tree;
     $("#recon").innerHTML = `<h3>${esc(r.test_id)} ` +
-      (r.integrity_ok ? '<span class="badge ok">数据完整：确认的都在、错的没进</span>' : '<span class="badge bad">数据不一致</span>') + " " +
+      (r.integrity_ok ? '<span class="badge ok">批次 / 数量对账通过</span>' : '<span class="badge bad">批次 / 数量不一致</span>') + " " +
       (r.exercise_complete ? '<span class="badge ok">演练完整</span>' : `<span class="badge">演练未完整：${esc(r.run.state)} / ${esc(r.run.finish_reason)}</span>`) + `</h3>` +
       row("发生器已发送批次", fmt(b.sent)) + row("我们确认（2xx）的批次", fmt(b.acked_by_us)) + row("实际落盘批次", fmt(b.stored)) +
       row("已确认但未落盘（丢失）", fmt(b.acked_but_missing), b.acked_but_missing === 0) +
       row("落盘但从未发送（幻影）", fmt(b.stored_never_sent), b.stored_never_sent === 0) +
       row("落盘但确认未送达（可接受）", fmt(b.stored_without_ack)) +
+      row("已发送但未确认 / 既未确认也未落盘", `${fmt(b.sent_unacknowledged)} / ${fmt(b.sent_unaccounted)}`) +
+      row("核验范围", "批次存在性与对象数量；不证明内容摘要一致") +
       row("对象：发生器确认 / 已确认批次中落盘", `${fmt(o.generator_acknowledged)} / ${fmt(o.stored_in_acked_batches)}`, o.generator_acknowledged == null || o.generator_acknowledged === o.stored_in_acked_batches) +
       row("对象：库中行数 / 落盘批次合计", `${fmt(o.rows_in_store)} / ${fmt(o.sum_of_stored_batches)}`, o.rows_in_store + o.identical_resends_kept_once === o.sum_of_stored_batches) +
       row("故障消息：发送 / 拒收 / 误收", `${fa.sent} / ${fa.rejected} / ${fa.acked}`, fa.acked === 0 && fa.stored === 0) +
