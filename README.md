@@ -209,7 +209,8 @@ bash scripts/fresh-clone-check.sh                                             # 
 
 ### 7.4 复现与平台
 
-FRESH_PLACEHOLDER
+- **全新 clone 复现**（`bash scripts/fresh-clone-check.sh`）：从 GitHub 克隆提交 `7d81157` 到新建的临时目录，`docker compose up --build`；回归测试 20/20 通过，一轮发生器（300 对象/s、30 s）对账数据完整 ✓ 演练完整 ✓。之后的提交只改 README。
+- **arm64**（`bash scripts/arm64-check.sh`）：最终代码在 QEMU 下构建 linux/arm64 镜像，`aarch64`、sqlite 3.46.1，orjson / uvloop / httptools / fastapi 均可导入；**20 个回归用例在 arm64 镜像里同样全部通过**。吞吐没有在 arm64 上测过（§8.9）。
 
 ---
 
