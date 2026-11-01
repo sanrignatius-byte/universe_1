@@ -167,6 +167,7 @@ docker run --rm -i cosmos-observatory python -I - /srv < tests/regression.py  # 
 - **资源**：整套测试中服务内存的最高采样值为 433 MiB（上限 4 GiB），CPU 最高采样值约 105%（单进程 GIL，见 §8.1）。发生器 CPU 约 45–50%，没有到它的 1 vCPU 上限。
 - **存储密度**：套件结束时库里约 128 万个对象，数据库 + WAL 共 2.04 GB，约 1.6 KB/对象（含索引）。按 17 GiB 水位算，约可容纳 1,100 万个对象。
 - **回归测试**：`tests/regression.py` 11/11 通过（相同重试幂等、键顺序不影响去重、同批次号不同内容 409、跨批次对象冲突整批回滚且不污染计数/字段、相同对象跨批只存一份、未知类型 422、旧修订不覆盖新状态、修订冲突 409、成环 422、同组中坏消息不影响邻居、重启后内存状态重建）。
+- **全新 clone 复现**：`scripts/fresh-clone-check.sh` 从 GitHub 克隆 `2302a6f` 到空目录，`docker compose up --build`；回归测试 11/11 通过，一轮发生器（300 对象/s、30 s）对账数据完整 ✓ 演练完整 ✓。
 - **arm64**：`scripts/arm64-check.sh` 在 QEMU 下构建 linux/arm64 镜像，确认 `aarch64`、sqlite 3.46.1，以及 orjson、uvloop、httptools、fastapi 都能导入。
 - **探索阶段**：最早的 `e2e-001`、`perf-001..003`、`crash-001` 的记录也保留在 `results/` 中。它们出自更早的代码版本，仅供参考。
 
