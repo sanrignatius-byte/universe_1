@@ -29,6 +29,12 @@ out=$(bash "$here/gen.sh" start "$id" http://host.docker.internal:8000/ingest "$
 echo "$out" | head -c 300; echo
 if echo "$out" | grep -q '"error"'; then echo "generator refused to start"; exit 1; fi
 sleep 2
+# sample resource usage while the round runs
+( while true; do docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}' \
+    cosmos-observatory object-source 2>/dev/null | sed "s/^/$(date +%T) /"; sleep 4; done ) \
+  > "$here/../results/$id-docker-stats.txt" &
+sampler=$!
+trap 'kill $sampler 2>/dev/null || true' EXIT
 while true; do
   s=$(curl -sS http://127.0.0.1:9001/status)
   state=$(echo "$s" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
@@ -50,3 +56,7 @@ echo "--- reconcile"
 curl -sS -X POST "$OBS/api/reconcile" -H 'Content-Type: application/json' --data-binary @"$receipt" \
   | tee "$here/../results/$id-reconcile.json"
 echo
+echo "--- writer"
+curl -sS "$OBS/api/overview?test=$id" | python3 -c 'import json,sys; print(json.load(sys.stdin)["writer"])'
+echo "--- peak resource usage"
+sort -t= -k2 -rn "$here/../results/$id-docker-stats.txt" | head -4

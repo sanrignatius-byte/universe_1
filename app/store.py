@@ -115,7 +115,10 @@ class Store:
     def _open(path):
         c = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
         c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA synchronous=FULL")
+        # FULL: every commit fsyncs the WAL -> survives process, container and VM/power loss.
+        # NORMAL (opt-in): survives process/container crash, may lose the last commits on power loss.
+        sync = os.environ.get("SQLITE_SYNC", "FULL").upper()
+        c.execute(f"PRAGMA synchronous={'NORMAL' if sync == 'NORMAL' else 'FULL'}")
         c.execute("PRAGMA cache_size=-262144")  # 256 MiB
         c.execute("PRAGMA temp_store=MEMORY")
         c.execute("PRAGMA wal_autocheckpoint=4000")
@@ -127,7 +130,7 @@ class Store:
             c = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, isolation_level=None,
                                 check_same_thread=False, timeout=30)
             c.execute("PRAGMA query_only=1")
-            c.execute("PRAGMA cache_size=-65536")
+            c.execute("PRAGMA cache_size=-16384")  # 16 MiB per reader thread keeps worst case well under 4 GiB
             c.row_factory = sqlite3.Row
             self._local.c = c
         return c

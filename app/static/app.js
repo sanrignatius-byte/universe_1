@@ -98,7 +98,7 @@ async function renderOverview() {
     ["平均每组消息", w.groups ? (w.messages / w.groups).toFixed(1) : "–"], ["最近一次提交", w.last_commit_ms + " ms"],
     ["最长一次提交", w.max_commit_ms + " ms"], ["确认延迟 p50 / p99", `${w.ack_p50_ms ?? "–"} / ${w.ack_p99_ms ?? "–"} ms`],
     ["HTTP 结果", Object.entries(w.http).map(([k, v]) => `${k.slice(5)}: ${fmt(v)}`).join(" · ") || "–"],
-    ["持久化策略", "SQLite WAL · synchronous=FULL · 先提交后确认"], ["接收字节", bytes(s.bytes || 0)], ["服务运行", o.uptime_s + " s"],
+    ["持久化策略", `SQLite WAL · synchronous=${w.sync} · 先提交后确认`], ["接收字节", bytes(s.bytes || 0)], ["服务运行", o.uptime_s + " s"],
   ].map(([k, v]) => `<div>${k}</div><div>${esc(v)}</div>`).join("");
   const rj = await api("/api/rejects?" + qs({ test: S.test, limit: 8 }));
   $("#rejectsMini").innerHTML = rejectTable(rj, true);

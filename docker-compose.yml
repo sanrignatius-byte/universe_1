@@ -7,6 +7,8 @@ services:
       - "8000:8000"          # generator posts to http://host.docker.internal:8000/ingest
     volumes:
       - cosmos-data:/data    # SQLite database + WAL (persistent, not a host bind mount)
+    environment:
+      SQLITE_SYNC: ${SQLITE_SYNC:-FULL}   # FULL = fsync before every ack (default); NORMAL = faster, crash-safe but not power-loss-safe
     cpus: 4
     mem_limit: 4g
     memswap_limit: 4g

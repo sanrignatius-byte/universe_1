@@ -181,6 +181,7 @@ def overview(test: str = None):
             "last_commit_ms": round(store.last_commit_ms, 2), "max_commit_ms": round(store.max_commit_ms, 2),
             "ack_p50_ms": pct(0.5), "ack_p99_ms": pct(0.99),
             "http": {k: v for k, v in store.metrics.items() if k.startswith("http_")},
+            "sync": "NORMAL" if os.environ.get("SQLITE_SYNC", "FULL").upper() == "NORMAL" else "FULL",
         },
         "db_bytes": db_bytes,
         "uptime_s": int(time.time() - started),
