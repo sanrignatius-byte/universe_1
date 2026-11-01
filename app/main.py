@@ -1,9 +1,9 @@
 import asyncio
-import base64
 import hashlib
 import logging
 import os
 import queue
+import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -13,9 +13,13 @@ from fastapi.responses import FileResponse, ORJSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import validate
-from .store import MAX_DB_BYTES, MIN_FREE_BYTES, Job, Store
+from .reconcile import ReceiptError, reconcile_receipt
+from .store import MAX_DB_BYTES, MIN_FREE_BYTES, Job, Store, okey
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+# The writer thread blocks in SQLite (GIL released) and must win the GIL back from the busy
+# event-loop thread; a 1 ms switch interval (default 5 ms) shortens each hand-off.
+sys.setswitchinterval(float(os.environ.get("GIL_SWITCH_S", "0.001")))
 DB_PATH = os.environ.get("DB_PATH", "/data/cosmos.db")
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 MAX_BODY = 64 * 1024 * 1024
@@ -207,14 +211,26 @@ def tree(test: str = None):
     return {"test_id": store.test_ids[tk], "nodes": nodes}
 
 
+SEARCH_WINDOW = 1_000_000  # name search scans at most the newest N objects of a world
+
+
 @app.get("/api/objects")
 def objects(test: str = None, type: int = None, q: str = None, before: int = None, limit: int = 50):
     tk = _tk(test)
+    c = store.reader()
     limit = max(1, min(limit, 500))
     where, args = ["test_key=?"], [tk]
+    window = None
     if type is not None:
         ids = _subtree(tk, type)
-        where.append(f"type_id IN ({','.join('?' * len(ids))})")
+        # Plan choice: a common subtree is found fastest by walking the newest objects and
+        # filtering (unary + keeps SQLite off the type index, which would sort every match);
+        # a rare subtree is found fastest through the (test, type, seq) index.
+        counts = dict(c.execute("SELECT type_id, n FROM type_counts WHERE test_key=?", (tk,)).fetchall())
+        total = sum(counts.values()) or 1
+        share = sum(counts.get(i, 0) for i in ids) / total
+        col = "+type_id" if share > 0.02 and len(ids) > 1 else "type_id"
+        where.append(f"{col} IN ({','.join('?' * len(ids))})")
         args += ids
     if q:
         q = q.strip()
@@ -223,18 +239,20 @@ def objects(test: str = None, type: int = None, q: str = None, before: int = Non
             where.append("seq=?")
             args.append(int(q[len(prefix):]))
         else:
-            where.append("name LIKE ?")
-            args.append(f"%{q}%")
+            maxseq = c.execute("SELECT MAX(seq) FROM objects WHERE test_key=?", (tk,)).fetchone()[0] or 0
+            window = SEARCH_WINDOW
+            where += ["seq>?", "name LIKE ?"]
+            args += [maxseq - SEARCH_WINDOW, f"%{q}%"]
     if before is not None:
         where.append("seq<?")
         args.append(before)
     sql = (f"SELECT seq, batch_id, type_id, name, ts_ms, frame_kind, frame_id, x, y, z FROM objects"
            f" WHERE {' AND '.join(where)} ORDER BY seq DESC LIMIT ?")
-    rows = store.reader().execute(sql, args + [limit]).fetchall()
+    rows = c.execute(sql, args + [limit]).fetchall()
     tree = store.trees.get(tk, {})
     tid = store.test_ids[tk]
     out = [dict(r, id=f"{tid}-{r['seq']}", type_name=tree.get(r["type_id"], (0, "?"))[1]) for r in rows]
-    return {"items": out, "next": out[-1]["seq"] if len(out) == limit else None}
+    return {"items": out, "next": out[-1]["seq"] if len(out) == limit else None, "search_window": window}
 
 
 @app.get("/api/object/{oid}")
@@ -243,10 +261,13 @@ def object_detail(oid: str):
     tk = store.tests.get(base)
     if tk is None or not seq.isdigit():
         raise HTTPException(404, "unknown object")
-    r = store.reader().execute("SELECT * FROM objects WHERE test_key=? AND seq=?", (tk, int(seq))).fetchone()
+    c = store.reader()
+    r = c.execute("SELECT * FROM objects WHERE test_key=? AND seq=?", (tk, int(seq))).fetchone()
     if not r:
         raise HTTPException(404, "unknown object")
     d = dict(r)
+    a = c.execute("SELECT attrs FROM object_attrs WHERE okey=?", (okey(tk, int(seq)),)).fetchone()
+    d["attrs"] = a[0] if a else b"null"
     pos = None if d["frame_kind"] is None and d["x"] is None else {
         "frame_kind": d["frame_kind"], "frame_id": d["frame_id"], "unit": d["unit"], "x": d["x"], "y": d["y"], "z": d["z"]}
     return {"id": oid, "sequence": d["seq"], "type_id": d["type_id"], "type_path": _path(tk, d["type_id"]),
@@ -322,66 +343,22 @@ def rejects(test: str = None, limit: int = 100):
     return [dict(r) for r in rows]
 
 
-def _bits(s):
-    if not s:
-        return set()
-    b = base64.b64decode(s)
-    return {i * 8 + k for i, x in enumerate(b) if x for k in range(8) if x >> k & 1}
+MAX_RECEIPT_BYTES = 64 * 1024 * 1024
 
 
 @app.post("/api/reconcile")
 async def reconcile(request: Request):
-    """Compare a generator receipt with what is durably stored."""
-    r = orjson.loads(await request.body())
-    cfg = r.get("config", {})
-    test_id = cfg.get("test_id")
-    tk = store.tests.get(test_id)
-    if tk is None:
-        raise HTTPException(404, f"no data for test {test_id}")
-    offset = cfg.get("max_batches", 20000)
-    inj = r.get("injections", {})
-    sent, acked = _bits(r.get("sent_bitmap")), _bits(r.get("ack_bitmap"))
-    f_sent, f_ack, f_rej = _bits(inj.get("fault_sent_bitmap")), _bits(inj.get("fault_ack_bitmap")), _bits(inj.get("fault_rejected_bitmap"))
-    d_sent, d_ack = _bits(inj.get("duplicate_sent_bitmap")), _bits(inj.get("duplicate_ack_bitmap"))
-    c = store.reader()
-    stored = {}
-    for bid, n in c.execute("SELECT batch_id, n FROM batches WHERE test_key=?", (tk,)):
-        stored[bid] = n
-    normal = {b for b in stored if b < offset}
-    faults_stored = {b - offset for b in stored if b >= offset}
-    stored_objs = sum(stored[b] for b in normal)
-    acked_objs_in_store = sum(stored[b] for b in acked & normal)
-    gen_acked_objs = r.get("stats", {}).get("acknowledged_objects")
-    obj_rows = c.execute("SELECT COUNT(*) FROM objects WHERE test_key=?", (tk,)).fetchone()[0]
-    st = c.execute("SELECT tree_rev, dup_batches, id_conflicts FROM test_stats WHERE test_key=?", (tk,)).fetchone()
-    tree_ack = r.get("tree", {}).get("acknowledged_revision") or 0
-    revs = {x[0] for x in c.execute("SELECT revision FROM tree_revisions WHERE test_key=? AND revision<=?", (tk, tree_ack))}
-    tree_gaps = sorted(set(range(1, tree_ack + 1)) - revs)
-    lost = sorted(acked - normal)
-    phantom = sorted(normal - sent)
-    res = {
-        "test_id": test_id,
-        "run": {"state": r.get("stats", {}).get("state"), "finish_reason": r.get("stats", {}).get("finish_reason")},
-        "batches": {"sent": len(sent), "acked_by_us": len(acked), "stored": len(normal),
-                    "acked_but_missing": len(lost), "acked_but_missing_ids": lost[:50],
-                    "stored_never_sent": len(phantom),
-                    "stored_without_ack": len(normal & (sent - acked))},
-        "objects": {"generator_acknowledged": gen_acked_objs, "stored_in_acked_batches": acked_objs_in_store,
-                    "rows_in_store": obj_rows, "sum_of_stored_batches": stored_objs,
-                    "identical_resends_kept_once": st[2]},
-        "faults": {"sent": len(f_sent), "rejected": len(f_rej), "acked": len(f_ack),
-                   "stored": len(faults_stored)},
-        "duplicates": {"sent": len(d_sent), "acked": len(d_ack), "absorbed_by_store": st[1]},
-        "tree": {"generator_attempted": r.get("tree", {}).get("attempted_revision"),
-                 "generator_acknowledged": tree_ack, "stored_max": st[0], "gaps_in_acked_range": tree_gaps[:50]},
-    }
-    # integrity: nothing acknowledged is missing, nothing wrong was stored, counts add up
-    res["integrity_ok"] = (not lost and not phantom and not faults_stored and len(f_ack) == 0
-                           and obj_rows + st[2] == stored_objs
-                           and (gen_acked_objs is None or acked_objs_in_store == gen_acked_objs)
-                           and not tree_gaps)
-    # exercise: every injected fault was rejected, every duplicate acknowledged, run finished cleanly
-    res["exercise_complete"] = (len(f_rej) == len(f_sent) and len(d_ack) == len(d_sent)
-                                and res["run"]["state"] == "completed")
-    res["ok"] = res["integrity_ok"]
-    return res
+    """Compare a generator receipt with what is durably stored (see app/reconcile.py)."""
+    body = await request.body()
+    if len(body) > MAX_RECEIPT_BYTES:
+        raise HTTPException(413, "receipt too large")
+    try:
+        r = orjson.loads(body)
+    except orjson.JSONDecodeError as e:
+        raise HTTPException(422, f"receipt is not valid JSON: {e}")
+    try:
+        return await asyncio.to_thread(reconcile_receipt, store, r)
+    except ReceiptError as e:
+        raise HTTPException(422, str(e))
+    except LookupError as e:
+        raise HTTPException(404, str(e))

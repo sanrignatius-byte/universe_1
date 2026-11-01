@@ -6,6 +6,9 @@ claim the whole message was stored, which we refuse to do for broken data.
 """
 
 
+MAX_SEQUENCE = 1 << 40  # object keys are (test_key << 40) | sequence
+
+
 def _int(v):
     return type(v) is int
 
@@ -36,8 +39,8 @@ def check_objects(m, h_test, h_batch):
         if type(o) is not dict:
             return f"objects[{i}] is not an object"
         seq = o.get("sequence")
-        if not _int(seq) or seq < 0:
-            return f"objects[{i}].sequence missing or invalid"
+        if not _int(seq) or seq < 0 or seq >= MAX_SEQUENCE:
+            return f"objects[{i}].sequence missing or outside [0, 2^40)"
         if seq in seen:
             return f"objects[{i}].sequence {seq} repeated inside batch"
         seen.add(seq)
@@ -59,6 +62,9 @@ def check_objects(m, h_test, h_batch):
             for c in ("x", "y", "z"):
                 if not _num(p.get(c)):
                     return f"objects[{i}].position.{c} missing or not numeric"
+            for c in ("frame_kind", "frame_id", "unit"):
+                if c in p and type(p[c]) is not str:
+                    return f"objects[{i}].position.{c} must be a string"
         if type(o.get("attributes")) is not dict:
             return f"objects[{i}].attributes must be an object"
     return None

@@ -96,7 +96,8 @@ docker run --rm -i cosmos-observatory python -I - /srv < tests/regression.py  # 
 
 **存储模型**（`app/store.py`）：
 
-- `objects`：核心列 + `attrs` JSON；索引 `(test, seq)`、`(test, type, seq)`
+- `objects`：只放核心列（约 150 B/行）；索引 `(test, seq)`、`(test, type, seq)`
+- `object_attrs`：属性 JSON（约 1.5 KB/行），整数主键 `test<<40 | sequence`。和核心列分开存放，这样搜索、列表、星图扫描的是窄表（理由和前后对比见 §7）
 - `batches`：去重，同时充当摄入时间序列
 - `types` / `tree_revisions` / `tree_changes`：当前类型树 + 完整变更史（含旧名、旧父节点）
 - `type_counts` / `test_stats`：与数据**同事务**更新的计数，总览不扫表

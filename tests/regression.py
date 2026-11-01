@@ -168,6 +168,134 @@ def bad_message_in_group_does_not_affect_neighbours(st):
 
 
 @case
+def bool_vs_int_attribute_is_a_conflict(st):
+    assert send(st, batch(1, [obj(1, attrs={"flag": True, "n": {"deep": True}})]))[0] == 200
+    code, _ = send(st, batch(2, [obj(1, attrs={"flag": 1, "n": {"deep": True}})]))
+    assert code == 409, code
+    code, _ = send(st, batch(3, [obj(1, attrs={"flag": True, "n": {"deep": 1}})]))
+    assert code == 409, code
+    a = q(st, "SELECT attrs FROM object_attrs")[0][0]
+    assert orjson.loads(a) == {"flag": True, "n": {"deep": True}} and orjson.loads(a)["flag"] is True
+
+
+@case
+def identical_then_conflict_leaves_counters_untouched(st):
+    assert send(st, batch(1, [obj(1), obj(2)]))[0] == 200
+    code, _ = send(st, batch(2, [obj(1), obj(2, name="changed")]))   # obj1 identical, obj2 conflicts
+    assert code == 409, code
+    s = stats(st)
+    assert s["id_conflicts"] == 0 and s["objects"] == 2 and s["batches"] == 1, s
+
+
+@case
+def stale_create_after_delete_does_not_resurrect(st):
+    assert send(st, tree(3, [("delete", 3, 1, "B")]))[0] == 200
+    assert 3 not in st.trees[1]
+    assert send(st, tree(2, [("create", 3, 1, "zombie")])) == (200, "stored")   # late, older revision
+    assert 3 not in st.trees[1]
+    assert q(st, "SELECT applied FROM tree_changes WHERE revision=2") == [(0,)]
+    assert send(st, tree(4, [("rename", 3, 1, "late rename")]))[0] == 422      # newer change to a dead node
+    assert send(st, tree(5, [("create", 3, 1, "reborn")]))[0] == 200            # newer create revives it
+    assert st.trees[1][3] == (1, "reborn")
+    st.close()
+    st2 = Store(st.path)                                                        # tombstones survive restart
+    assert st2.trees[1][3] == (1, "reborn") and st2.node_revs[1][3] == 5
+    st2.close()
+
+
+@case
+def sequence_outside_key_range_is_rejected(st):
+    o = obj(1)
+    o["sequence"] = 2 ** 40
+    o["id"] = f"{T}-{2 ** 40}"
+    code, why = send(st, batch(1, [o]))
+    assert code == 422 and "sequence" in why, (code, why)
+
+
+@case
+def v1_database_is_migrated_in_place(st):
+    import sqlite3
+    path = os.path.join(tempfile.mkdtemp(), "v1.db")
+    c = sqlite3.connect(path)
+    c.executescript("""
+      CREATE TABLE tests(test_key INTEGER PRIMARY KEY, test_id TEXT UNIQUE NOT NULL, created_ms INTEGER);
+      CREATE TABLE objects(test_key INTEGER, seq INTEGER, batch_id INTEGER, type_id INTEGER, name TEXT,
+        ts_ms INTEGER, frame_kind TEXT, frame_id TEXT, unit TEXT, x REAL, y REAL, z REAL, attrs BLOB);
+      CREATE UNIQUE INDEX objects_pk ON objects(test_key, seq);
+      INSERT INTO tests VALUES(1, 'old', 0);
+      INSERT INTO objects VALUES(1, 7, 0, 2, 'legacy', 0, NULL, NULL, NULL, NULL, NULL, NULL, '{"k":true}');
+    """)
+    c.commit()
+    c.close()
+    st2 = Store(path)
+    cols = [r[1] for r in st2.conn.execute("PRAGMA table_info(objects)")]
+    assert "attrs" not in cols, cols
+    assert q(st2, "SELECT name FROM objects WHERE seq=7") == [("legacy",)]
+    assert orjson.loads(q(st2, "SELECT attrs FROM object_attrs")[0][0]) == {"k": True}
+    st2.close()
+
+
+# ---------------------------------------------------------------- reconcile
+def b64bits(ids):
+    import base64
+    ids = list(ids)
+    b = bytearray((max(ids) // 8 + 1) if ids else 1)
+    for i in ids:
+        b[i >> 3] |= 1 << (i & 7)
+    return base64.b64encode(bytes(b)).decode()
+
+
+def receipt(sent, acked, fault_sent=(), fault_rej=(), dup=(), tree_ack=1, acked_objs=None, state="completed"):
+    return {"config": {"test_id": T, "max_batches": 20000},
+            "sent_bitmap": b64bits(sent), "ack_bitmap": b64bits(acked),
+            "injections": {"fault_sent_bitmap": b64bits(fault_sent), "fault_ack_bitmap": b64bits(()),
+                           "fault_rejected_bitmap": b64bits(fault_rej),
+                           "duplicate_sent_bitmap": b64bits(dup), "duplicate_ack_bitmap": b64bits(dup)},
+            "tree": {"attempted_revision": tree_ack, "acknowledged_revision": tree_ack},
+            "stats": {"acknowledged_objects": acked_objs, "state": state}}
+
+
+@case
+def reconcile_happy_path(st):
+    from app.reconcile import reconcile_receipt
+    assert send(st, batch(0, [obj(1)]))[0] == 200 and send(st, batch(1, [obj(2)]))[0] == 200
+    r = reconcile_receipt(st, receipt({0, 1}, {0, 1}, acked_objs=2))
+    assert r["integrity_ok"] and r["exercise_complete"], r
+
+
+@case
+def reconcile_compares_sets_not_counts(st):
+    from app.reconcile import reconcile_receipt
+    assert send(st, batch(0, [obj(1)]))[0] == 200
+    r = reconcile_receipt(st, receipt({0}, {0}, fault_sent={2}, fault_rej={3}, acked_objs=1))
+    assert r["integrity_ok"] and not r["exercise_complete"], r
+
+
+@case
+def reconcile_rejects_incomplete_receipt(st):
+    from app.reconcile import ReceiptError, reconcile_receipt
+    assert send(st, batch(0, [obj(1)]))[0] == 200
+    bad = receipt({0}, {0}, acked_objs=1)
+    del bad["ack_bitmap"]
+    try:
+        reconcile_receipt(st, bad)
+        raise AssertionError("missing ack_bitmap accepted")
+    except ReceiptError:
+        pass
+
+
+@case
+def reconcile_huge_revision_is_cheap(st):
+    import time
+    from app.reconcile import reconcile_receipt
+    assert send(st, batch(0, [obj(1)]))[0] == 200
+    t0 = time.perf_counter()
+    r = reconcile_receipt(st, receipt({0}, {0}, tree_ack=10 ** 9, acked_objs=1))
+    assert time.perf_counter() - t0 < 1.0
+    assert not r["integrity_ok"] and r["tree"]["gaps_in_acked_range"] == 10 ** 9 - 1, r["tree"]
+
+
+@case
 def restart_rebuilds_memory(st):
     assert send(st, tree(2, [("create", 4, 2, "A1")]))[0] == 200
     assert send(st, batch(1, [obj(1, type_id=4)]))[0] == 200

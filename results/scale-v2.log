@@ -1,0 +1,16 @@
+{"test_id": "scale-v2", "processes": 16, "batch_size": 100, "seconds": 180.3, "acked_batches": 12113, "acked_objects": 1211300, "errors": 0, "objects_per_s": 6717, "batches_per_s": 67, "latency_ms_p50": 220.3, "p99": 532.4, "max": 863.7}
+cosmos-observatory cpu=0.15% mem=406.4MiB / 4GiB
+--- endpoint latency on 1211300 objects, 1.75 GiB
+overview             first      18 ms   best-of-2      18 ms
+tree                 first       3 ms   best-of-2       3 ms
+objects newest       first       5 ms   best-of-2       6 ms
+objects by type      first       7 ms   best-of-2       6 ms
+objects page 2       first       8 ms   best-of-2       7 ms
+search common        first      12 ms   best-of-2       7 ms
+search no match      first     816 ms   best-of-2     800 ms
+search exact id      first      12 ms   best-of-2       3 ms
+object detail        first       4 ms   best-of-2       3 ms
+sky map              first    1430 ms   best-of-2     707 ms
+fields               first      35 ms   best-of-2      36 ms
+changes              first       3 ms   best-of-2       3 ms
+rejects              first       3 ms   best-of-2       2 ms

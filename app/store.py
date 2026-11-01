@@ -6,6 +6,7 @@ queued up while the previous commit was running into one transaction
 ("group commit"), so one fsync covers many messages. Each message runs inside
 its own SAVEPOINT, so one bad message is rolled back without touching the rest.
 """
+import functools
 import logging
 import os
 import queue
@@ -32,13 +33,16 @@ CREATE TABLE IF NOT EXISTS batches(
 CREATE INDEX IF NOT EXISTS batches_time ON batches(test_key, committed_ms);
 CREATE TABLE IF NOT EXISTS objects(
   test_key INTEGER, seq INTEGER, batch_id INTEGER, type_id INTEGER, name TEXT,
-  ts_ms INTEGER, frame_kind TEXT, frame_id TEXT, unit TEXT, x REAL, y REAL, z REAL,
-  attrs BLOB);
+  ts_ms INTEGER, frame_kind TEXT, frame_id TEXT, unit TEXT, x REAL, y REAL, z REAL);
+-- the (large, ~1.5 KB) attribute JSON lives in its own table so that scans over
+-- objects (search, map, lists) touch ~150 B rows instead of ~1.6 KB rows
+CREATE TABLE IF NOT EXISTS object_attrs(okey INTEGER PRIMARY KEY, attrs BLOB);
 CREATE UNIQUE INDEX IF NOT EXISTS objects_pk ON objects(test_key, seq);
 CREATE INDEX IF NOT EXISTS objects_type ON objects(test_key, type_id, seq);
 CREATE TABLE IF NOT EXISTS types(
   test_key INTEGER, type_id INTEGER, parent_id INTEGER, name TEXT,
-  created_rev INTEGER, updated_rev INTEGER, PRIMARY KEY(test_key, type_id)) WITHOUT ROWID;
+  created_rev INTEGER, updated_rev INTEGER, deleted_rev INTEGER,
+  PRIMARY KEY(test_key, type_id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS tree_revisions(
   test_key INTEGER, revision INTEGER, n_changes INTEGER, committed_ms INTEGER, digest BLOB,
   PRIMARY KEY(test_key, revision)) WITHOUT ROWID;
@@ -63,10 +67,34 @@ MIGRATIONS = [
     "ALTER TABLE batches ADD COLUMN digest BLOB",
     "ALTER TABLE tree_revisions ADD COLUMN digest BLOB",
     "ALTER TABLE tree_changes ADD COLUMN applied INTEGER DEFAULT 1",
+    "ALTER TABLE types ADD COLUMN deleted_rev INTEGER",
 ]
 
 TREE_OPS = {"create", "rename", "move", "update", "delete"}
-OBJ_COLS = "type_id, name, ts_ms, frame_kind, frame_id, unit, x, y, z, attrs, batch_id"
+OBJ_COLS = "type_id, name, ts_ms, frame_kind, frame_id, unit, x, y, z, batch_id"
+
+
+def okey(test_key, seq):
+    """Integer key of an object's attribute row: test in the high bits, sequence in the low 40."""
+    return (test_key << 40) | seq
+
+
+@functools.lru_cache(maxsize=64)
+def _multi_insert(table, ncols, nrows):
+    row = "(" + ",".join("?" * ncols) + ")"
+    return f"INSERT INTO {table} VALUES " + ",".join([row] * nrows)
+
+
+MULTI_ROWS = 400  # rows per multi-row INSERT (keeps parameters well under SQLite's 32766 limit)
+
+
+def insert_rows(c, table, ncols, rows):
+    """One multi-row INSERT per chunk instead of executemany: the sqlite3 module releases and
+    re-acquires the GIL around every statement step, so executemany costs one GIL hand-off
+    per row; under a busy event loop each hand-off can wait a full switch interval."""
+    for i in range(0, len(rows), MULTI_ROWS):
+        chunk = rows[i:i + MULTI_ROWS]
+        c.execute(_multi_insert(table, ncols, len(chunk)), [v for r in chunk for v in r])
 
 MAX_DB_BYTES = int(float(os.environ.get("MAX_DB_GIB", "17")) * (1 << 30))      # of the 20 GiB volume
 MIN_FREE_BYTES = int(float(os.environ.get("MIN_FREE_GIB", "1")) * (1 << 30))   # headroom for WAL/checkpoint
@@ -89,6 +117,24 @@ def json_type(v):
     if t is dict:
         return "object"
     return "null"
+
+
+def same_core(old, new_row):
+    """Stored core columns vs a new object row. Types matter (True is not 1, "1" is not 1);
+    coordinates are compared as numbers because SQLite keeps them as REAL."""
+    for a, b in zip(old[:6], new_row[3:9]):        # type_id, name, ts_ms, frame_kind, frame_id, unit
+        if type(a) is not type(b) or a != b:
+            return False
+    for a, b in zip(old[6:9], new_row[9:12]):      # x, y, z
+        if (a is None) != (b is None) or (a is not None and float(a) != float(b)):
+            return False
+    return True
+
+
+def same_json(stored_bytes, value):
+    """Exact JSON equality, independent of key order: true != 1, 1 != 1.0, nested too."""
+    opt = orjson.OPT_SORT_KEYS
+    return orjson.dumps(orjson.loads(stored_bytes), option=opt) == orjson.dumps(value, option=opt)
 
 
 class Conflict(Exception):
@@ -124,6 +170,7 @@ class Store:
             os.makedirs(d, exist_ok=True)
         self.q = queue.Queue(maxsize=queue_max)
         self.conn = self._open(path)
+        self._migrate_v1()
         self.conn.executescript(SCHEMA)
         for sql in MIGRATIONS:
             try:
@@ -165,17 +212,42 @@ class Store:
             self._local.c = c
         return c
 
+    def _migrate_v1(self):
+        """v1 kept the attribute JSON inside `objects`. Move it to `object_attrs` in place,
+        in one transaction (no data volume has to be deleted to upgrade)."""
+        c = self.conn
+        cols = [r[1] for r in c.execute("PRAGMA table_info(objects)")]
+        if "attrs" not in cols:
+            return
+        log.warning("migrating %s from schema v1 (attributes inside objects)", self.path)
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            c.execute("CREATE TABLE IF NOT EXISTS object_attrs(okey INTEGER PRIMARY KEY, attrs BLOB)")
+            c.execute("INSERT OR IGNORE INTO object_attrs SELECT (test_key << 40) | seq, attrs FROM objects")
+            c.execute("CREATE TABLE objects_v2(test_key INTEGER, seq INTEGER, batch_id INTEGER, type_id INTEGER,"
+                      " name TEXT, ts_ms INTEGER, frame_kind TEXT, frame_id TEXT, unit TEXT, x REAL, y REAL, z REAL)")
+            c.execute("INSERT INTO objects_v2 SELECT test_key, seq, batch_id, type_id, name, ts_ms, frame_kind,"
+                      " frame_id, unit, x, y, z FROM objects ORDER BY rowid")
+            c.execute("DROP TABLE objects")  # drops its indexes; SCHEMA recreates them
+            c.execute("ALTER TABLE objects_v2 RENAME TO objects")
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+
     # ---------- in-memory state rebuilt from the DB ----------
     def _load_memory(self):
         c = self.conn
         self.tests = {tid: k for k, tid in c.execute("SELECT test_key, test_id FROM tests")}
         self.test_ids = {k: tid for tid, k in self.tests.items()}
         trees, revs = defaultdict(dict), defaultdict(dict)
-        for tk, tid, pid, name, urev in c.execute("SELECT test_key, type_id, parent_id, name, updated_rev FROM types"):
-            trees[tk][tid] = (pid, name)
-            revs[tk][tid] = urev
-        self.trees = dict(trees)      # values are replaced, never mutated in place
-        self.node_revs = dict(revs)   # revision that last changed each node
+        for tk, tid, pid, name, urev, drev in c.execute(
+                "SELECT test_key, type_id, parent_id, name, updated_rev, deleted_rev FROM types"):
+            if drev is None:
+                trees[tk][tid] = (pid, name)
+            revs[tk][tid] = urev  # for a deleted node this is the delete revision (tombstone)
+        self.trees = dict(trees)      # live nodes; values are replaced, never mutated in place
+        self.node_revs = dict(revs)   # revision that last changed each node, deleted ones included
         fields = defaultdict(set)
         for tk, tid, name in c.execute("SELECT test_key, type_id, name FROM fields"):
             fields[(tk, tid)].add(name)
@@ -367,8 +439,9 @@ class Store:
         missing = sorted({o["type_id"] for o in objs if o["type_id"] not in tree})
         if missing:
             raise Conflict(422, f"unknown type_id {missing[:5]} (tree revision {m['tree_revision']})")
-        rows = []
+        rows, arows = [], []
         dumps = orjson.dumps
+        base = tk << 40
         for o in objs:
             p = o["position"]
             if p is None:
@@ -376,24 +449,30 @@ class Store:
             else:
                 fk, fi, un = p.get("frame_kind"), p.get("frame_id"), p.get("unit")
                 x, y, z = p["x"], p["y"], p["z"]
-            rows.append((tk, o["sequence"], bid, o["type_id"], o["name"], o["timestamp_ms"],
-                         fk, fi, un, x, y, z, dumps(o["attributes"])))
-        ins = "INSERT INTO objects VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            seq = o["sequence"]
+            rows.append((tk, seq, bid, o["type_id"], o["name"], o["timestamp_ms"], fk, fi, un, x, y, z))
+            arows.append((base | seq, dumps(o["attributes"])))
+        ins = "INSERT INTO objects VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+        ains = "INSERT INTO object_attrs VALUES(?,?)"
+        identical = 0  # message-local: merged into the totals only once the whole message is stored
         if not slow:
-            c.executemany(ins, rows)  # IntegrityError -> caller retries with slow=True
+            insert_rows(c, "objects", 12, rows)  # IntegrityError -> caller retries with slow=True
+            insert_rows(c, "object_attrs", 2, arows)
             accepted = list(zip(objs, rows))
         else:
             accepted = []
-            for o, r in zip(objs, rows):
+            for o, r, ar in zip(objs, rows, arows):
                 old = c.execute(f"SELECT {OBJ_COLS} FROM objects WHERE test_key=? AND seq=?", (tk, r[1])).fetchone()
                 if old is None:
                     c.execute(ins, r)
+                    c.execute(ains, ar)
                     accepted.append((o, r))
                     continue
-                same = (tuple(old[:9]) == r[3:12] and orjson.loads(old[9]) == o["attributes"])
-                if not same:
-                    raise Conflict(409, f"object {o['id']} already stored by batch {old[10]} with different content")
-                st["id_conflicts"] += 1  # identical re-send under a new batch id: keep one copy
+                oa = c.execute("SELECT attrs FROM object_attrs WHERE okey=?", (ar[0],)).fetchone()
+                if not (same_core(old, r) and oa is not None and same_json(oa[0], o["attributes"])):
+                    raise Conflict(409, f"object {o['id']} already stored by batch {old[9]} with different content")
+                identical += 1  # identical re-send under a new batch id: keep one copy
+        st["id_conflicts"] += identical
         t = now_ms()
         c.execute("INSERT INTO batches VALUES(?,?,?,?,?,?,?)",
                   (tk, bid, len(objs), m["tree_revision"], j.nbytes, t, j.digest))
@@ -439,9 +518,12 @@ class Store:
             old = tree.get(tid)
             if op not in TREE_OPS:
                 raise Conflict(422, f"changes[{i}]: unknown op {op!r}")
-            if old is not None and nrev.get(tid, 0) > rev:
-                # a newer revision already set this node: keep the newer state, record the stale change
-                change_rows.append((tk, rev, i, op, tid, pid, name, old[0], old[1], 0))
+            if nrev.get(tid, 0) > rev:
+                # A newer revision already set (or deleted) this node: per-node last-writer-wins.
+                # The stale change is recorded but not applied, so a late create cannot revive
+                # a node deleted by a newer revision (tombstone) and a late rename cannot undo a newer one.
+                change_rows.append((tk, rev, i, op, tid, pid, name,
+                                    old[0] if old else None, old[1] if old else None, 0))
                 continue
             if op == "create" and old is not None:
                 raise Conflict(422, f"changes[{i}]: type {tid} already exists")
@@ -451,7 +533,7 @@ class Store:
                 if any(p == tid for p, _ in tree.values()):
                     raise Conflict(422, f"changes[{i}]: type {tid} still has children")
                 del tree[tid]
-                nrev.pop(tid, None)
+                nrev[tid] = rev  # tombstone
             else:
                 if pid != 0 and pid not in tree:
                     raise Conflict(422, f"changes[{i}]: parent {pid} does not exist")
@@ -467,13 +549,14 @@ class Store:
         for (_, _, _, op, tid, pid, name, _, _, applied) in change_rows:
             if not applied:
                 continue
-            if op == "delete":
-                c.execute("DELETE FROM types WHERE test_key=? AND type_id=?", (tk, tid))
+            if op == "delete":  # keep the row as a tombstone so the delete revision survives restarts
+                c.execute("UPDATE types SET deleted_rev=?, updated_rev=? WHERE test_key=? AND type_id=?",
+                          (rev, rev, tk, tid))
             else:
                 c.execute(
-                    "INSERT INTO types VALUES(?,?,?,?,?,?) ON CONFLICT(test_key,type_id) DO UPDATE SET"
-                    " parent_id=excluded.parent_id, name=excluded.name, updated_rev=excluded.updated_rev",
-                    (tk, tid, pid, name, rev, rev))
+                    "INSERT INTO types VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(test_key,type_id) DO UPDATE SET"
+                    " parent_id=excluded.parent_id, name=excluded.name, updated_rev=excluded.updated_rev,"
+                    " deleted_rev=NULL", (tk, tid, pid, name, rev, rev))
         c.executemany("INSERT INTO tree_changes VALUES(?,?,?,?,?,?,?,?,?,?)", change_rows)
         c.execute("INSERT INTO tree_revisions VALUES(?,?,?,?,?)", (tk, rev, len(change_rows), now_ms(), j.digest))
         # replace atomically; readers never see a half-applied tree. On a later group

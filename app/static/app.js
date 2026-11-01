@@ -288,8 +288,9 @@ $("#receipt").onchange = async (e) => {
       row("对象：库中行数 / 落盘批次合计", `${fmt(o.rows_in_store)} / ${fmt(o.sum_of_stored_batches)}`, o.rows_in_store + o.identical_resends_kept_once === o.sum_of_stored_batches) +
       row("故障消息：发送 / 拒收 / 误收", `${fa.sent} / ${fa.rejected} / ${fa.acked}`, fa.acked === 0 && fa.stored === 0) +
       row("重复批次：发送 / 吸收", `${du.sent} / ${du.absorbed_by_store}`) +
-      row("类型树修订：发生器确认 / 已存最大 / 缺口", `${t.generator_acknowledged} / ${t.stored_max} / ${t.gaps_in_acked_range.length}`, t.gaps_in_acked_range.length === 0);
-  } catch (err) { $("#recon").innerHTML = `<p class="badge bad">${esc(err.message)}</p>`; }
+      row("故障集合：发送但未拒收 / 拒收但未发送", `${fa.sent_but_not_rejected_ids.length} / ${fa.rejected_but_not_sent_ids.length}`, fa.sent_but_not_rejected_ids.length === 0 && fa.rejected_but_not_sent_ids.length === 0) +
+      row("类型树修订：发生器确认 / 已存最大 / 缺口", `${t.generator_acknowledged} / ${t.stored_max} / ${t.gaps_in_acked_range}`, t.gaps_in_acked_range === 0);
+  } catch (err) { $("#recon").innerHTML = `<p class="badge bad">无法对账：${esc(err.message)}</p>`; }
 };
 
 // ---------------------------------------------------------------- refresh loop

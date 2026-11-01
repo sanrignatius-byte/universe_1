@@ -12,6 +12,7 @@ services:
     cpus: 4
     mem_limit: 4g
     memswap_limit: 4g
+    init: true               # tini as PID 1: a crashed server process ends the container, so the restart policy applies
     restart: unless-stopped
     logging:                 # bounded logs: they count against the same disk budget
       driver: json-file
