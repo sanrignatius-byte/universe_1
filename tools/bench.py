@@ -52,7 +52,8 @@ def worker(idx, nproc, url, test_id, seconds, bsize, tpl, rev, out):
         for j in range(bsize):
             seq = bid * bsize + j
             s = tpl[seq % len(tpl)]
-            parts.append(s.replace('"@ID@"', f'"{test_id}-{seq}"').replace("-424242", str(seq)))
+            # replace the sequence placeholder first and exactly: the id itself may contain "424242"
+            parts.append(s.replace('"sequence":-424242', f'"sequence":{seq}').replace('"@ID@"', f'"{test_id}-{seq}"'))
         body = (f'{{"kind":"objects","test_id":"{test_id}","batch_id":{bid},"tree_revision":{rev},'
                 f'"objects":[{",".join(parts)}]}}')
         h = {"Content-Type": "application/json", "X-Flightgen-Kind": "objects",

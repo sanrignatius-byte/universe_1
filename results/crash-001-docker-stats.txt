@@ -1,0 +1,6 @@
+10:14:57 cosmos-observatory cpu=13.56% mem=366.8MiB / 4GiB
+10:14:57 object-source cpu=4.35% mem=28.8MiB / 256MiB
+10:15:02 cosmos-observatory cpu=23.05% mem=366.8MiB / 4GiB
+10:15:02 object-source cpu=5.42% mem=29.04MiB / 256MiB
+10:15:08 cosmos-observatory cpu=0.00% mem=0B / 0B
+10:15:08 object-source cpu=1.46% mem=28.06MiB / 256MiB
