@@ -173,7 +173,8 @@ def overview(test: str = None):
     top = {}
     for tid, n in counts.items():
         p = _path(tk, tid)
-        key = p[1]["name"] if len(p) > 1 else (p[0]["name"] if p else f"#{tid}")
+        node = p[1] if len(p) > 1 else (p[0] if p else {"type_id": tid, "name": f"#{tid}"})
+        key = (node["type_id"], node["name"])  # the id drives the colour, identical on every page
         top[key] = top.get(key, 0) + n
     lat = sorted(store.ack_lat[-5000:])
     pct = (lambda q: round(lat[min(len(lat) - 1, int(q * len(lat)))], 2)) if lat else (lambda q: None)
@@ -183,7 +184,7 @@ def overview(test: str = None):
         "types": len(tree),
         "fields": c.execute("SELECT COUNT(*) FROM fields WHERE test_key=?", (tk,)).fetchone()[0],
         "rate": [dict(r) for r in rate],
-        "categories": sorted(({"name": k, "n": v} for k, v in top.items()), key=lambda x: -x["n"]),
+        "categories": sorted(({"id": k[0], "name": k[1], "n": v} for k, v in top.items()), key=lambda x: -x["n"]),
         "writer": {
             "queue": store.q.qsize(), "groups": store.metrics["groups"], "messages": store.metrics["messages"],
             "last_commit_ms": round(store.last_commit_ms, 2), "max_commit_ms": round(store.max_commit_ms, 2),

@@ -1,6 +1,6 @@
-:root{--bg:#0b1020;--panel:#121a30;--line:#24304f;--text:#dce4f5;--mute:#8a97b6;--acc:#6ea8fe;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#f5b84b}
+:root{--bg:#0c111b;--panel:#131a27;--line:#212b3c;--text:#dce3f0;--mute:#8592ab;--acc:#6ea8fe;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#f5b84b}
 *{box-sizing:border-box}
-body{margin:0;background:radial-gradient(ellipse at top,#16224a 0,var(--bg) 60%);color:var(--text);font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;min-height:100vh}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;min-height:100vh}
 header{display:flex;align-items:center;gap:20px;padding:10px 20px;border-bottom:1px solid var(--line);background:rgba(11,16,32,.85);position:sticky;top:0;z-index:5;flex-wrap:wrap}
 .brand{font-weight:700;font-size:17px}.sub{color:var(--mute);font-weight:400;font-size:12px;margin-left:6px}
 nav button{background:none;border:0;color:var(--mute);padding:6px 12px;font-size:14px;cursor:pointer;border-radius:6px}
@@ -58,3 +58,36 @@ pre{background:#0a0f1e;border:1px solid var(--line);border-radius:8px;padding:10
 .recon-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:5px 0}
 code{background:#0a0f1e;padding:1px 5px;border-radius:4px}
 @media (max-width:900px){.grid2,.split{grid-template-columns:1fr}.treecard{max-height:360px}}
+/* overview hierarchy */
+.kpis{display:block}
+.kpis-main{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:10px}
+.kpis-sub{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+.kpi.big{padding:16px 18px}.kpi.big .v{font-size:30px}
+.kpi.small{padding:8px 12px;background:transparent}.kpi.small .v{font-size:16px;font-weight:600}
+.kpi.link{display:flex;align-items:center}
+/* map: observation desk */
+.mapdesk{display:grid;grid-template-columns:250px minmax(0,1fr) 330px;gap:16px;align-items:start}
+.mapdesk>.card{margin-bottom:0}
+.mapside h3{margin-top:14px}.mapside h3:first-child{margin-top:0}
+.mapside small{color:var(--mute);font-weight:400}
+select.full{width:100%}
+.seg{display:flex;gap:0;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{flex:1;background:#0e1522;color:var(--mute);border:0;border-right:1px solid var(--line);padding:5px 6px;cursor:pointer}
+.seg button:last-child{border-right:0}.seg button.on,.seg button:hover{background:#1c2740;color:#fff}
+.chk{display:flex;gap:6px;align-items:center;margin-top:10px;color:var(--mute);font-size:13px}
+.legend.col{flex-direction:column;gap:2px}
+.lg{display:flex;align-items:center;gap:6px;width:100%;background:none;border:0;color:var(--text);padding:3px 4px;border-radius:5px;cursor:pointer;text-align:left;font-size:13px}
+.lg:hover{background:#18233a}.lg b{flex:1;font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lg span{color:var(--mute);font-size:12px;font-variant-numeric:tabular-nums}.lg.off{opacity:.35}.lg.off i{background:#555!important}
+.lg i{display:inline-block;width:10px;height:10px;border-radius:50%}
+.maptool{min-height:30px}
+.chip{display:inline-flex;align-items:center;gap:8px;background:rgba(110,168,254,.12);color:var(--acc);border:1px solid rgba(110,168,254,.35);border-radius:14px;padding:2px 4px 2px 12px;font-size:13px}
+.chip button{background:none;border:0;color:var(--acc);cursor:pointer;padding:2px 8px}
+.chip.hidden,.tip.hidden{display:none}
+.mapwrap{height:calc(100vh - 230px);min-height:460px;background:#070b13}
+#sky{cursor:grab}#sky:active{cursor:grabbing}
+.tip{position:absolute;pointer-events:none;background:rgba(10,15,26,.95);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;white-space:nowrap;max-width:280px;overflow:hidden;text-overflow:ellipsis}
+.mapdetail{max-height:calc(100vh - 110px);overflow:auto}
+.mapdetail h2{font-size:16px}
+@media (max-width:1250px){.mapdesk{grid-template-columns:230px minmax(0,1fr)}.mapdetail{grid-column:1 / -1;max-height:none}}
+@media (max-width:900px){.mapdesk{grid-template-columns:1fr}.kpis-main{grid-template-columns:repeat(2,minmax(0,1fr))}}

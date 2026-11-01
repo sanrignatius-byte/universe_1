@@ -39,11 +39,11 @@ async function loadTests() {
     S.test = sel.value || null;
   } catch (e) { /* no data yet */ }
 }
-$("#test").onchange = () => { S.test = $("#test").value; S.tree = null; S.sel = null; S.frame = null; refresh(true); };
+$("#test").onchange = () => { S.test = $("#test").value; S.tree = null; S.sel = null; M.frame = null; M.view = null; M.sel = null; M.hidden.clear(); refresh(true); };
 
 // ---------------------------------------------------------------- tree helpers
 async function loadTree(force) {
-  if (S.tree && !force) return S.tree;
+  if (S.tree && !force && !S.treeStale) return S.tree;
   const d = await api("/api/tree?" + qs({ test: S.test }));
   const by = new Map(), kids = new Map();
   d.nodes.forEach((n) => { by.set(n.id, n); if (!kids.has(n.parent)) kids.set(n.parent, []); kids.get(n.parent).push(n.id); });
@@ -57,11 +57,15 @@ async function loadTree(force) {
   const walk = (id, top) => { topOf.set(id, top); (kids.get(id) || []).forEach((k) => walk(k, top)); };
   tops.forEach((t) => walk(t, t));
   roots.forEach((r) => topOf.set(r, r));
-  const color = new Map(tops.map((t, i) => [t, PALETTE[i % PALETTE.length]]));
-  S.tree = { by, kids, total, roots, tops, topOf, color, maxRev: Math.max(0, ...d.nodes.map((n) => n.created_rev || 0)) };
+  // replace the whole tree only after a successful load: colours and labels never fall back mid-refresh
+  S.tree = { by, kids, total, roots, tops, topOf, maxRev: Math.max(0, ...d.nodes.map((n) => n.created_rev || 0)) };
+  S.treeStale = false;
   return S.tree;
 }
-const typeColor = (tid) => S.tree?.color.get(S.tree.topOf.get(tid)) || "#8a97b6";
+// one colour per first-level category, derived from its id: identical on every page and after every refresh
+const catColor = (top) => PALETTE[((top % PALETTE.length) + PALETTE.length) % PALETTE.length];
+const topId = (tid) => S.tree?.topOf.get(tid) ?? tid;
+const typeColor = (tid) => catColor(topId(tid));
 
 // ---------------------------------------------------------------- overview
 async function renderOverview() {
@@ -70,13 +74,21 @@ async function renderOverview() {
   const last = o.rate.length ? o.rate[o.rate.length - 1] : null;
   const recent = o.rate.filter((r) => r.sec >= Date.now() / 1000 - 6);
   const nowRate = recent.length ? Math.round(recent.reduce((a, r) => a + r.n, 0) / Math.max(1, recent.length)) : 0;
-  const tiles = [
-    ["已落盘对象", fmt(s.objects), "good"], ["当前摄入 /s", fmt(nowRate)], ["已确认批次", fmt(s.batches)],
-    ["类型数", fmt(o.types)], ["字段种类", fmt(o.fields)], ["类型树修订", fmt(s.tree_rev)],
-    ["吸收的重复批", fmt(s.dup_batches), s.dup_batches ? "warn" : ""], ["拒收的故障消息", fmt(s.rejected), s.rejected ? "warn" : ""],
-    ["确认延迟 p99", o.writer.ack_p99_ms == null ? "–" : o.writer.ack_p99_ms + " ms"], ["存储占用", bytes(o.db_bytes)],
+  const w0 = o.writer;
+  const primary = [
+    ["已落盘对象", fmt(s.objects), "good"],
+    ["当前摄入（对象/秒）", fmt(nowRate)],
+    ["确认延迟 p50 / p99", `${w0.ack_p50_ms ?? "–"} / ${w0.ack_p99_ms ?? "–"} ms`],
+    ["数据把关：拒收故障 · 吸收重复", `${fmt(s.rejected)} · ${fmt(s.dup_batches)}`, s.rejected || s.dup_batches ? "warn" : ""],
   ];
-  $("#kpis").innerHTML = tiles.map(([l, v, c]) => `<div class="kpi ${c || ""}"><div class="v">${v}</div><div class="l">${l}</div></div>`).join("");
+  const secondary = [
+    ["已确认批次", fmt(s.batches)], ["类型数", fmt(o.types)], ["字段种类", fmt(o.fields)], ["类型树修订", fmt(s.tree_rev)],
+    ["对象 ID 冲突", fmt(s.id_conflicts)], ["存储占用", bytes(o.db_bytes)], ["落盘级别", w0.sync],
+  ];
+  $("#kpis").innerHTML =
+    `<div class="kpis-main">${primary.map(([l, v, c]) => `<div class="kpi big ${c || ""}"><div class="v">${v}</div><div class="l">${l}</div></div>`).join("")}</div>` +
+    `<div class="kpis-sub">${secondary.map(([l, v]) => `<div class="kpi small"><div class="v">${esc(v)}</div><div class="l">${l}</div></div>`).join("")}` +
+    `<div class="kpi small link"><div class="l">完整性对账（逐批核对 receipt）见「数据可信」页</div></div></div>`;
   const sec = o.rate.map((r) => r.sec), now = Math.floor(Date.now() / 1000);
   const map = new Map(o.rate.map((r) => [r.sec, r.n]));
   const xs = [], ys = [];
@@ -90,7 +102,7 @@ async function renderOverview() {
   chart("catChart").setOption({
     backgroundColor: "transparent", grid: { left: 90, right: 20, top: 10, bottom: 20 }, tooltip: {},
     xAxis: { type: "value" }, yAxis: { type: "category", inverse: true, data: o.categories.map((c) => c.name) },
-    series: [{ type: "bar", data: o.categories.map((c, i) => ({ value: c.n, itemStyle: { color: PALETTE[i % PALETTE.length] } })) }],
+    series: [{ type: "bar", data: o.categories.map((c) => ({ value: c.n, itemStyle: { color: catColor(c.id) } })) }],
   });
   const w = o.writer;
   $("#writer").innerHTML = [
@@ -184,64 +196,221 @@ $("#more").onclick = () => loadObjects(false);
 $("#qGo").onclick = () => loadObjects(true);
 $("#q").onkeydown = (e) => { if (e.key === "Enter") loadObjects(true); };
 
-async function showObject(id) {
-  const o = await api("/api/object/" + encodeURIComponent(id));
+function objectHtml(o) {
   const p = o.position;
-  $("#mbody").innerHTML = `<h2 style="margin:0 0 4px">${esc(o.name)}</h2>
+  return `<h2 style="margin:0 0 4px">${esc(o.name)}</h2>
     <div class="hint">${esc(o.id)} · 序号 ${o.sequence} · 批次 ${o.batch_id}</div>
     <p>${o.type_path.map((t) => `<span class="badge">${esc(t.name)}</span>`).join(" › ")}</p>
     <div class="kv"><div>观测时间</div><div>${ts(o.timestamp_ms)} (${o.timestamp_ms})</div>
     <div>位置</div><div>${p ? `${esc(p.frame_kind)} · ${esc(p.frame_id)} · (${p.x}, ${p.y}, ${p.z}) ${esc(p.unit)}` : "无（非空间对象）"}</div>
-    <div>属性数</div><div>${Object.keys(o.attributes).length}</div></div>
+    <div>属性数</div><div>${Object.keys(o.attributes || {}).length}</div></div>
     <h3>属性</h3><pre>${esc(JSON.stringify(o.attributes, null, 2))}</pre>`;
+}
+async function showObject(id) {
+  const o = await api("/api/object/" + encodeURIComponent(id));
+  $("#mbody").innerHTML = objectHtml(o);
   $("#modal").classList.remove("hidden");
 }
 $("#mclose").onclick = () => $("#modal").classList.add("hidden");
 $("#modal").onclick = (e) => { if (e.target.id === "modal") $("#modal").classList.add("hidden"); };
 
-// ---------------------------------------------------------------- map
-async function renderMap() {
-  await loadTree(false);
-  // one reference frame at a time: kind + frame_id + unit (local frames have no shared origin)
-  const cur = S.frame || {};
-  const d = await api("/api/map?" + qs({ test: S.test, kind: cur.frame_kind, frame_id: cur.frame_id, unit: cur.unit, type: S.sel, limit: 20000 }));
-  S.frames = d.frames;
-  S.frame = d.frame;
-  const key = (f) => f ? `${f.frame_kind}|${f.frame_id}|${f.unit}` : "";
-  $("#frame").innerHTML = d.frames.map((f, i) => `<option value="${i}" ${key(f) === key(d.frame) ? "selected" : ""}>${esc(f.frame_kind)} · ${esc(f.frame_id)} · ${esc(f.unit)}（${fmt(f.n)}）</option>`).join("");
-  S.mapPts = d.points;
-  drawMap();
-  $("#legend").innerHTML = S.tree.tops.map((t) => `<span><i style="background:${S.tree.color.get(t)}"></i>${esc(S.tree.by.get(t).name)}</span>`).join("");
+// ---------------------------------------------------------------- map (observation desk)
+// projections: [index of horizontal coord, index of vertical coord, labels] into points [seq, type, x, y, z]
+const AX = { xy: [2, 3, "X", "Y"], xz: [2, 4, "X", "Z"], yz: [3, 4, "Y", "Z"] };
+const M = { pts: [], frames: [], frame: null, window: 0, proj: "xy", view: null, key: "", hidden: new Set(),
+            sel: null, hover: null, drag: null, updated: null, loading: false, toScreen: null };
+const MAP_HINT = `<p class="hint">点击星图上的光点，在这里查看对象详情。</p>`;
+const frameKey = (f) => (f ? `${f.frame_kind}|${f.frame_id}|${f.unit}` : "");
+const mapKey = () => `${frameKey(M.frame)}|${M.proj}|${S.sel ?? ""}`;
+const fmtAxis = (v) => (v !== 0 && (Math.abs(v) >= 1e7 || Math.abs(v) < 1e-2) ? v.toExponential(1) : fmt(Math.round(v * 100) / 100));
+function niceStep(raw) {
+  const e = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / e;
+  return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * e;
 }
+
+async function renderMap(keepView) {
+  if (M.loading) return;
+  M.loading = true;
+  try {
+    await loadTree(false);
+    const cur = M.frame || {};
+    const d = await api("/api/map?" + qs({ test: S.test, kind: cur.frame_kind, frame_id: cur.frame_id, unit: cur.unit, type: S.sel, limit: 20000 }));
+    M.frames = d.frames;
+    M.frame = d.frame;
+    M.window = d.window || 0;
+    M.pts = d.points;
+    M.updated = new Date();
+    const k = mapKey();
+    if (!keepView || k !== M.key) { M.view = null; M.sel = null; }   // new frame / projection / filter: fit again
+    M.key = k;
+    $("#frame").innerHTML = d.frames.map((f, i) => `<option value="${i}" ${frameKey(f) === frameKey(d.frame) ? "selected" : ""}>${esc(f.frame_kind)} · ${esc(f.frame_id)} · ${esc(f.unit)}（累计 ${fmt(f.n)}）</option>`).join("");
+    renderMapChrome();
+    drawMap();
+  } finally { M.loading = false; }
+}
+
+function renderMapChrome() {
+  const f = M.frame;
+  const chip = $("#mapFilter");
+  if (S.sel && S.tree?.by.has(S.sel)) {
+    chip.innerHTML = `当前类型：${esc(pathOf(S.sel).map((x) => x.name).join(" › "))} <button id="mapClear" title="清除类型筛选">✕ 清除</button>`;
+    chip.classList.remove("hidden");
+    $("#mapClear").onclick = () => { S.sel = null; document.querySelectorAll("#tree .node.sel").forEach((x) => x.classList.remove("sel")); renderMap(false); };
+  } else chip.classList.add("hidden");
+  const total = f ? (M.frames.find((x) => frameKey(x) === frameKey(f))?.n ?? 0) : 0;
+  const shown = M.pts.filter((p) => !M.hidden.has(topId(p[1]))).length;
+  $("#mapCount").textContent = f
+    ? `本次显示 ${fmt(shown)} 个点（取样 ${fmt(M.pts.length)}：该参考系最新 ${fmt(M.window)} 个对象序号窗口内最多 20,000 点）· 该参考系累计 ${fmt(total)} 个对象`
+    : "这一轮没有带坐标的对象";
+  $("#mapUpdated").textContent = M.updated ? `最后更新 ${M.updated.toTimeString().slice(0, 8)}` : "";
+  const cnt = new Map();
+  for (const p of M.pts) { const t = topId(p[1]); cnt.set(t, (cnt.get(t) || 0) + 1); }
+  const tops = [...cnt.keys()].sort((a, b) => cnt.get(b) - cnt.get(a));
+  $("#legend").innerHTML = tops.map((t) => `<button class="lg ${M.hidden.has(t) ? "off" : ""}" data-top="${t}" title="点击显示/隐藏">
+      <i style="background:${catColor(t)}"></i><b>${esc(S.tree?.by.get(t)?.name ?? "#" + t)}</b><span>${fmt(cnt.get(t))}</span></button>`).join("")
+    || `<p class="hint">无</p>`;
+}
+
+function fitView(W, H) {
+  const [ix, iy] = AX[M.proj];
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, n = 0;
+  for (const p of M.pts) {
+    if (M.hidden.has(topId(p[1]))) continue;
+    const x = p[ix], y = p[iy]; n++;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  if (!n) return { cx: 0, cy: 0, k: 1 };
+  const pad = 40, dx = (x1 - x0) || 1, dy = (y1 - y0) || 1;
+  return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, k: Math.min((W - 2 * pad) / dx, (H - 2 * pad) / dy) };
+}
+
 function drawMap() {
   const cv = $("#sky"), dpr = window.devicePixelRatio || 1;
-  const w = cv.clientWidth, h = cv.clientHeight;
-  cv.width = w * dpr; cv.height = h * dpr;
-  const g = cv.getContext("2d"); g.scale(dpr, dpr);
-  g.fillStyle = "#050914"; g.fillRect(0, 0, w, h);
-  const pts = S.mapPts; if (!pts.length) { g.fillStyle = "#8a97b6"; g.fillText("该坐标系暂无对象", 20, 30); return; }
-  const yi = $("#proj").value === "xz" ? 4 : 3;
-  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-  for (const p of pts) { x0 = Math.min(x0, p[2]); x1 = Math.max(x1, p[2]); y0 = Math.min(y0, p[yi]); y1 = Math.max(y1, p[yi]); }
-  const pad = 20, sx = (w - 2 * pad) / ((x1 - x0) || 1), sy = (h - 2 * pad) / ((y1 - y0) || 1), s = Math.min(sx, sy);
-  const ox = pad + ((w - 2 * pad) - (x1 - x0) * s) / 2, oy = pad + ((h - 2 * pad) - (y1 - y0) * s) / 2;
-  S.proj = (p) => [ox + (p[2] - x0) * s, h - (oy + (p[yi] - y0) * s)];
-  g.globalCompositeOperation = "lighter";
-  for (const p of pts) { const [X, Y] = S.proj(p); g.fillStyle = typeColor(p[1]); g.globalAlpha = 0.7; g.fillRect(X - 1, Y - 1, 2.2, 2.2); }
-  g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
-  g.fillStyle = "#8a97b6"; g.font = "12px sans-serif";
-  const f = S.frame || {};
-  g.fillText(`${f.frame_kind} · ${f.frame_id} · 单位 ${f.unit} · ${fmt(pts.length)} 个对象 · x ∈ [${fmt(x0)}, ${fmt(x1)}] ${f.unit}`, 12, h - 12);
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = "#070b13"; g.fillRect(0, 0, W, H);
+  const f = M.frame;
+  if (!f || !M.pts.length) { M.toScreen = null; g.fillStyle = "#8a97b6"; g.font = "13px sans-serif"; g.fillText("该参考系暂无对象", 20, 30); return; }
+  if (!M.view) M.view = fitView(W, H);
+  const { cx, cy, k } = M.view, [ix, iy, ax, ay] = AX[M.proj];
+  const sx = (x) => W / 2 + (x - cx) * k, sy = (y) => H / 2 - (y - cy) * k;
+  M.toScreen = (p) => [sx(p[ix]), sy(p[iy])];
+  // grid, tick labels, origin
+  const step = niceStep(90 / k);
+  const xa = cx - W / 2 / k, xb = cx + W / 2 / k, ya = cy - H / 2 / k, yb = cy + H / 2 / k;
+  g.lineWidth = 1; g.strokeStyle = "rgba(148,163,196,0.09)"; g.beginPath();
+  for (let x = Math.ceil(xa / step) * step; x <= xb; x += step) { const X = Math.round(sx(x)) + 0.5; g.moveTo(X, 0); g.lineTo(X, H); }
+  for (let y = Math.ceil(ya / step) * step; y <= yb; y += step) { const Y = Math.round(sy(y)) + 0.5; g.moveTo(0, Y); g.lineTo(W, Y); }
+  g.stroke();
+  g.font = "11px sans-serif"; g.fillStyle = "#5f6d8c";
+  for (let x = Math.ceil(xa / step) * step; x <= xb; x += step) g.fillText(fmtAxis(x), sx(x) + 3, H - 6);
+  for (let y = Math.ceil(ya / step) * step; y <= yb; y += step) g.fillText(fmtAxis(y), 4, sy(y) - 3);
+  if (xa <= 0 && 0 <= xb && ya <= 0 && 0 <= yb) {
+    const X = sx(0), Y = sy(0);
+    g.strokeStyle = "rgba(245,184,75,0.55)"; g.beginPath(); g.moveTo(X - 9, Y); g.lineTo(X + 9, Y); g.moveTo(X, Y - 9); g.lineTo(X, Y + 9); g.stroke();
+    g.fillStyle = "rgba(245,184,75,0.85)"; g.fillText("原点", X + 6, Y - 6);
+  }
+  // points: soft round dots, grouped by colour (no additive blending, so dense areas keep their colour)
+  const groups = new Map(), r = 1.9;
+  for (const p of M.pts) {
+    const t = topId(p[1]);
+    if (M.hidden.has(t)) continue;
+    const X = sx(p[ix]), Y = sy(p[iy]);
+    if (X < -4 || Y < -4 || X > W + 4 || Y > H + 4) continue;
+    const c = catColor(t);
+    let a = groups.get(c); if (!a) groups.set(c, (a = []));
+    a.push(X, Y);
+  }
+  g.globalAlpha = 0.55;
+  for (const [c, a] of groups) {
+    g.fillStyle = c; g.beginPath();
+    for (let i = 0; i < a.length; i += 2) { g.moveTo(a[i] + r, a[i + 1]); g.arc(a[i], a[i + 1], r, 0, 6.2832); }
+    g.fill();
+  }
+  g.globalAlpha = 1;
+  const ring = (p, color, rad, glow) => {
+    const [X, Y] = M.toScreen(p); g.save();
+    if (glow) { g.shadowColor = color; g.shadowBlur = 14; }
+    g.strokeStyle = color; g.lineWidth = 2; g.beginPath(); g.arc(X, Y, rad, 0, 6.2832); g.stroke(); g.restore();
+  };
+  if (M.hover && M.hover !== M.sel) ring(M.hover, "#ffffff", 5, false);
+  if (M.sel) ring(M.sel, "#f5b84b", 7, true);
+  // axis names and scale bar (top right)
+  g.fillStyle = "#9aa7c4"; g.font = "12px sans-serif";
+  g.fillText(`${ax} →`, W - 34, H - 20); g.fillText(`↑ ${ay}`, 8, 16);
+  const bar = step * k, bx = W - 18 - bar;
+  g.strokeStyle = "#cbd5e1"; g.lineWidth = 2; g.beginPath(); g.moveTo(bx, 22); g.lineTo(bx + bar, 22); g.moveTo(bx, 17); g.lineTo(bx, 27); g.moveTo(bx + bar, 17); g.lineTo(bx + bar, 27); g.stroke();
+  g.fillText(`${fmtAxis(step)} ${f.unit}`, bx, 14);
 }
-$("#sky").onclick = (e) => {
-  if (!S.proj) return;
-  const r = e.target.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
-  let best = null, bd = 64;
-  for (const p of S.mapPts) { const [X, Y] = S.proj(p); const d = (X - mx) ** 2 + (Y - my) ** 2; if (d < bd) { bd = d; best = p; } }
-  if (best) showObject(`${S.test}-${best[0]}`);
+
+function pickAt(mx, my, rad = 8) {
+  if (!M.toScreen) return null;
+  let best = null, bd = rad * rad;
+  for (const p of M.pts) {
+    if (M.hidden.has(topId(p[1]))) continue;
+    const [X, Y] = M.toScreen(p), d = (X - mx) ** 2 + (Y - my) ** 2;
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+async function showMapDetail(id) {
+  try { $("#mapDetail").innerHTML = objectHtml(await api("/api/object/" + encodeURIComponent(id))); }
+  catch (e) { $("#mapDetail").innerHTML = `<p class="badge bad">${esc(e.message)}</p>`; }
+}
+const sky = $("#sky");
+const rel = (e) => { const r = sky.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+sky.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  if (!M.view) return;
+  const [mx, my] = rel(e), W = sky.clientWidth, H = sky.clientHeight, v = M.view;
+  const dx = v.cx + (mx - W / 2) / v.k, dy = v.cy - (my - H / 2) / v.k;          // the data point under the cursor stays put
+  const k2 = Math.min(Math.max(v.k * Math.exp(-e.deltaY * 0.0015), 1e-12), 1e12);
+  M.view = { k: k2, cx: dx - (mx - W / 2) / k2, cy: dy + (my - H / 2) / k2 };
+  drawMap();
+}, { passive: false });
+sky.addEventListener("mousedown", (e) => { const [mx, my] = rel(e); M.drag = { mx, my, cx: M.view?.cx, cy: M.view?.cy, moved: false }; });
+window.addEventListener("mouseup", (e) => {
+  const d = M.drag; M.drag = null;
+  if (!d || d.moved || S.tab !== "map") return;
+  const [mx, my] = rel(e), p = pickAt(mx, my);
+  if (p) { M.sel = p; drawMap(); showMapDetail(`${S.test}-${p[0]}`); }
+});
+sky.addEventListener("mousemove", (e) => {
+  const [mx, my] = rel(e), d = M.drag;
+  if (d && M.view) {
+    if (Math.abs(mx - d.mx) + Math.abs(my - d.my) > 3) d.moved = true;
+    if (d.moved) { M.view = { ...M.view, cx: d.cx - (mx - d.mx) / M.view.k, cy: d.cy + (my - d.my) / M.view.k }; drawMap(); }
+    $("#tip").classList.add("hidden");
+    return;
+  }
+  const p = pickAt(mx, my);
+  if (p !== M.hover) { M.hover = p; drawMap(); }
+  const tip = $("#tip");
+  if (p) {
+    const [ix, iy] = AX[M.proj], n = S.tree?.by.get(p[1]);
+    tip.textContent = `${S.test}-${p[0]} · ${n ? n.name : "#" + p[1]} · (${fmtAxis(p[ix])}, ${fmtAxis(p[iy])}) ${M.frame?.unit ?? ""}`;
+    tip.style.left = Math.max(0, Math.min(mx + 14, sky.clientWidth - 280)) + "px"; tip.style.top = my + 12 + "px";
+    tip.classList.remove("hidden");
+  } else tip.classList.add("hidden");
+});
+sky.addEventListener("mouseleave", () => { $("#tip").classList.add("hidden"); if (M.hover) { M.hover = null; drawMap(); } });
+$("#frame").onchange = () => { M.frame = M.frames[Number($("#frame").value)]; renderMap(false); };
+document.querySelectorAll("#projSeg button").forEach((b) => b.onclick = () => {
+  M.proj = b.dataset.proj;
+  document.querySelectorAll("#projSeg button").forEach((x) => x.classList.toggle("on", x === b));
+  M.view = null; M.key = mapKey(); drawMap();
+});
+$("#fit").onclick = () => { M.view = null; drawMap(); };
+$("#resetView").onclick = () => { M.view = null; M.hidden.clear(); M.sel = null; $("#mapDetail").innerHTML = MAP_HINT; renderMapChrome(); drawMap(); };
+$("#legend").onclick = (e) => {
+  const b = e.target.closest("button[data-top]"); if (!b) return;
+  const t = Number(b.dataset.top);
+  M.hidden.has(t) ? M.hidden.delete(t) : M.hidden.add(t);
+  renderMapChrome(); drawMap();
 };
-$("#frame").onchange = () => { S.frame = S.frames[Number($("#frame").value)]; renderMap(); };
-$("#proj").onchange = drawMap;
 
 // ---------------------------------------------------------------- evolution
 async function renderEvolve() {
@@ -302,7 +471,7 @@ async function refresh(force) {
     if (!S.test) { $("#kpis").innerHTML = `<div class="kpi"><div class="v">等待数据</div><div class="l">发生器尚未发送任何消息</div></div>`; return; }
     if (S.tab === "overview") await renderOverview();
     else if (S.tab === "explore") { await renderTree(force); if (force) await loadObjects(true); }
-    else if (S.tab === "map") { if (force) await renderMap(); }
+    else if (S.tab === "map") { if (force) await renderMap(true); }
     else if (S.tab === "evolve") await renderEvolve();
     else if (S.tab === "trust") await renderTrust();
     $("#live").classList.remove("off");
@@ -310,5 +479,10 @@ async function refresh(force) {
   finally { busy = false; }
 }
 let tick = 0;
-setInterval(() => { tick++; if (S.tab === "overview" || (S.tab === "trust" && tick % 3 === 0)) refresh(false); if (tick % 10 === 0) { loadTests(); S.tree = null; } }, 2000);
+setInterval(() => {
+  tick++;
+  if (S.tab === "overview" || (S.tab === "trust" && tick % 3 === 0)) refresh(false);
+  if (S.tab === "map" && $("#mapAuto").checked && tick % 3 === 0) renderMap(true).catch((e) => console.warn(e));
+  if (tick % 10 === 0) { loadTests(); S.treeStale = true; }
+}, 2000);
 refresh(true);
