@@ -1,34 +1,86 @@
 
-################ bash scripts/run-test.sh final-example 200 120 20 4 bursty
-{"error":"receipt already exists for this test_id; choose a new test_id"}
+################ bash scripts/run-test.sh example-104732 200 120 20 4 bursty
+{"config":{"workload":"objects","objects":{"faults":{"duplicate_rate":0.02,"incomplete_rate":0.01,"invalid_rate":0.01},"scenario":"evolving","initial_types":24,"max_types":4096,"tree_every_batches":10,"max_depth":5,"max_object_bytes":8192},"rate_profile":"bursty","ramp_seconds":10,"target_url":"http
+saved /mnt/h/exam-prep/exam-work/cosmos-observatory/scripts/../results/example-104732-receipt.json
+--- generator stats
+{'state': 'completed', 'finish_reason': 'duration', 'elapsed_seconds': 120.001527017, 'attempted_objects': 21400, 'acknowledged_objects': 21400, 'attempted_batches': 1070, 'acknowledged_batches': 1070, 'unacknowledged_batches': 0, 'retries': 0, 'timeouts': 0, 'http_4xx': 0, 'http_5xx': 0, 'network_errors': 0, 'average_latency_ms': 12.173056634579439, 'max_latency_ms': 249.639911}
+objects/s acknowledged: 178.3
+--- reconcile
+{"test_id":"example-104732","run":{"state":"completed","finish_reason":"duration"},"batches":{"sent":1070,"acked_by_us":1070,"stored":1070,"acked_but_missing":0,"acked_but_missing_ids":[],"stored_never_sent":0,"stored_without_ack":0},"objects":{"generator_acknowledged":21400,"stored_in_acked_batches":21400,"rows_in_store":21400,"sum_of_stored_batches":21400,"identical_resends_kept_once":0},"faults":{"sent":18,"rejected":18,"acked":0,"stored":0,"sent_but_not_rejected_ids":[],"rejected_but_not_sent_ids":[]},"duplicates":{"sent":28,"acked":28,"absorbed_by_store":28},"tree":{"generator_attempted":108,"generator_acknowledged":108,"stored_max":108,"gaps_in_acked_range":0,"first_gaps":[]},"integrity_ok":true,"exercise_complete":true,"ok":true}
+--- writer
+{'queue': 0, 'groups': 1213, 'messages': 1224, 'last_commit_ms': 10.22, 'max_commit_ms': 235.86, 'ack_p50_ms': 4.06, 'ack_p99_ms': 88.04, 'http': {'http_200': 1206, 'http_422': 16, 'http_400': 2}, 'sync': 'FULL'}
+--- highest resource samples
+10:47:58 cosmos-observatory cpu=45.06% mem=51.75MiB / 4GiB
+10:48:18 cosmos-observatory cpu=44.19% mem=59.95MiB / 4GiB
+10:48:05 cosmos-observatory cpu=15.98% mem=44.02MiB / 4GiB
+10:48:44 cosmos-observatory cpu=14.44% mem=63.45MiB / 4GiB
+integrity_ok: True exercise_complete: True
+exit=0
 
-generator refused to start: {"error":"receipt already exists for this test_id; choose a new test_id"}
-exit=1
+################ bash scripts/run-test.sh max-b20-104732 0 60 20 4 steady
+{"config":{"workload":"objects","objects":{"faults":{"duplicate_rate":0.02,"incomplete_rate":0.01,"invalid_rate":0.01},"scenario":"evolving","initial_types":24,"max_types":4096,"tree_every_batches":10,"max_depth":5,"max_object_bytes":8192},"rate_profile":"steady","ramp_seconds":0,"target_url":"http:
+saved /mnt/h/exam-prep/exam-work/cosmos-observatory/scripts/../results/max-b20-104732-receipt.json
+--- generator stats
+{'state': 'completed', 'finish_reason': 'duration', 'elapsed_seconds': 60.00277009, 'attempted_objects': 213300, 'acknowledged_objects': 213220, 'attempted_batches': 10665, 'acknowledged_batches': 10661, 'unacknowledged_batches': 4, 'retries': 0, 'timeouts': 0, 'http_4xx': 0, 'http_5xx': 0, 'network_errors': 0, 'average_latency_ms': 15.97072735564932, 'max_latency_ms': 171.53538}
+objects/s acknowledged: 3553.5
+--- reconcile
+{"test_id":"max-b20-104732","run":{"state":"completed","finish_reason":"duration"},"batches":{"sent":10665,"acked_by_us":10661,"stored":10665,"acked_but_missing":0,"acked_but_missing_ids":[],"stored_never_sent":0,"stored_without_ack":4},"objects":{"generator_acknowledged":213220,"stored_in_acked_batches":213220,"rows_in_store":213300,"sum_of_stored_batches":213300,"identical_resends_kept_once":0},"faults":{"sent":202,"rejected":202,"acked":0,"stored":0,"sent_but_not_rejected_ids":[],"rejected_but_not_sent_ids":[]},"duplicates":{"sent":210,"acked":210,"absorbed_by_store":210},"tree":{"generator_attempted":1067,"generator_acknowledged":1067,"stored_max":1067,"gaps_in_acked_range":0,"first_gaps":[]},"integrity_ok":true,"exercise_complete":true,"ok":true}
+--- writer
+{'queue': 0, 'groups': 8937, 'messages': 13368, 'last_commit_ms': 37.53, 'max_commit_ms': 235.86, 'ack_p50_ms': 10.47, 'ack_p99_ms': 50.57, 'http': {'http_200': 13148, 'http_422': 194, 'http_400': 26}, 'sync': 'FULL'}
+--- highest resource samples
+10:50:23 cosmos-observatory cpu=105.86% mem=368.8MiB / 4GiB
+10:49:51 cosmos-observatory cpu=84.75% mem=182.2MiB / 4GiB
+10:50:03 cosmos-observatory cpu=72.03% mem=271.7MiB / 4GiB
+10:50:29 cosmos-observatory cpu=71.14% mem=369.6MiB / 4GiB
+integrity_ok: True exercise_complete: True
+exit=0
 
-################ bash scripts/run-test.sh final-max-b20 0 60 20 4 steady
-{"error":"receipt already exists for this test_id; choose a new test_id"}
+################ bash scripts/run-test.sh max-b100-104732 0 60 100 16 steady
+{"config":{"workload":"objects","objects":{"faults":{"duplicate_rate":0.02,"incomplete_rate":0.01,"invalid_rate":0.01},"scenario":"evolving","initial_types":24,"max_types":4096,"tree_every_batches":10,"max_depth":5,"max_object_bytes":8192},"rate_profile":"steady","ramp_seconds":0,"target_url":"http:
+saved /mnt/h/exam-prep/exam-work/cosmos-observatory/scripts/../results/max-b100-104732-receipt.json
+--- generator stats
+{'state': 'completed', 'finish_reason': 'duration', 'elapsed_seconds': 60.004835991, 'attempted_objects': 388400, 'acknowledged_objects': 388000, 'attempted_batches': 3884, 'acknowledged_batches': 3880, 'unacknowledged_batches': 4, 'retries': 0, 'timeouts': 0, 'http_4xx': 0, 'http_5xx': 0, 'network_errors': 0, 'average_latency_ms': 85.40798053347065, 'max_latency_ms': 446.330853}
+objects/s acknowledged: 6466.1
+--- reconcile
+{"test_id":"max-b100-104732","run":{"state":"completed","finish_reason":"duration"},"batches":{"sent":3884,"acked_by_us":3880,"stored":3883,"acked_but_missing":0,"acked_but_missing_ids":[],"stored_never_sent":0,"stored_without_ack":3},"objects":{"generator_acknowledged":388000,"stored_in_acked_batches":388000,"rows_in_store":388300,"sum_of_stored_batches":388300,"identical_resends_kept_once":0},"faults":{"sent":64,"rejected":64,"acked":0,"stored":0,"sent_but_not_rejected_ids":[],"rejected_but_not_sent_ids":[]},"duplicates":{"sent":79,"acked":79,"absorbed_by_store":79},"tree":{"generator_attempted":389,"generator_acknowledged":389,"stored_max":389,"gaps_in_acked_range":0,"first_gaps":[]},"integrity_ok":true,"exercise_complete":true,"ok":true}
+--- writer
+{'queue': 0, 'groups': 10704, 'messages': 17783, 'last_commit_ms': 19.33, 'max_commit_ms': 243.81, 'ack_p50_ms': 51.11, 'ack_p99_ms': 198.34, 'http': {'http_200': 17499, 'http_422': 251, 'http_400': 33}, 'sync': 'FULL'}
+--- highest resource samples
+10:51:05 cosmos-observatory cpu=141.77% mem=395.8MiB / 4GiB
+10:51:36 cosmos-observatory cpu=100.25% mem=415.2MiB / 4GiB
+10:50:45 cosmos-observatory cpu=88.12% mem=388.1MiB / 4GiB
+10:51:29 cosmos-observatory cpu=79.47% mem=403.3MiB / 4GiB
+integrity_ok: True exercise_complete: True
+exit=0
 
-generator refused to start: {"error":"receipt already exists for this test_id; choose a new test_id"}
-exit=1
+################ bash scripts/crash-test.sh crash-104732 2000 40 12 1
+{"config":{"workload":"objects","objects":{"faults":{"duplicate_rate":0.02,"incomplete_rate":0.01,"invalid_rate":0.01},"scenario":"evolving","initial_types":24,"max_types":4096,"tree_every_batches":10,"max_depth":5,"max_object_bytes":8192},"rate_profile":"bursty","ramp_seconds":3,"target_url":"http:
+[crash] 10:51:55 mode=process kill #1
+SIGKILL uvicorn pid 8
+[crash] restarted and healthy after 2.1 s
+saved /mnt/h/exam-prep/exam-work/cosmos-observatory/scripts/../results/crash-104732-receipt.json
+--- generator stats
+{'state': 'completed', 'finish_reason': 'duration', 'elapsed_seconds': 40.001751738, 'attempted_objects': 36740, 'acknowledged_objects': 36580, 'attempted_batches': 1837, 'acknowledged_batches': 1829, 'unacknowledged_batches': 8, 'retries': 16, 'timeouts': 0, 'http_4xx': 0, 'http_5xx': 0, 'network_errors': 24, 'average_latency_ms': 13.623009924446844, 'max_latency_ms': 1026.662638}
+objects/s acknowledged: 914.5
+--- reconcile
+{"test_id":"crash-104732","run":{"state":"completed","finish_reason":"duration"},"batches":{"sent":1837,"acked_by_us":1829,"stored":1829,"acked_but_missing":0,"acked_but_missing_ids":[],"stored_never_sent":0,"stored_without_ack":0},"objects":{"generator_acknowledged":36580,"stored_in_acked_batches":36580,"rows_in_store":36580,"sum_of_stored_batches":36580,"identical_resends_kept_once":0},"faults":{"sent":30,"rejected":30,"acked":0,"stored":0,"sent_but_not_rejected_ids":[],"rejected_but_not_sent_ids":[]},"duplicates":{"sent":39,"acked":39,"absorbed_by_store":39},"tree":{"generator_attempted":184,"generator_acknowledged":184,"stored_max":184,"gaps_in_acked_range":0,"first_gaps":[]},"integrity_ok":true,"exercise_complete":true,"ok":true}
+--- writer
+{'queue': 0, 'groups': 1322, 'messages': 1547, 'last_commit_ms': 8.2, 'max_commit_ms': 97.82, 'ack_p50_ms': 7.43, 'ack_p99_ms': 53.95, 'http': {'http_200': 1523, 'http_422': 20, 'http_400': 4}, 'sync': 'FULL'}
+--- highest resource samples
+10:52:04 cosmos-observatory cpu=73.30% mem=67.23MiB / 4GiB
+10:52:09 cosmos-observatory cpu=34.72% mem=78.57MiB / 4GiB
+10:52:16 object-source cpu=25.60% mem=28.96MiB / 256MiB
+10:51:52 cosmos-observatory cpu=22.95% mem=408.5MiB / 4GiB
+integrity_ok: True exercise_complete: True
+restart count: 1
+exit=0
 
-################ bash scripts/run-test.sh final-max-b100 0 60 100 16 steady
-{"error":"receipt already exists for this test_id; choose a new test_id"}
-
-generator refused to start: {"error":"receipt already exists for this test_id; choose a new test_id"}
-exit=1
-
-################ bash scripts/crash-test.sh final-crash 2000 40 12 1
-{"error":"receipt already exists for this test_id; choose a new test_id"}
-
-generator refused to start: {"error":"receipt already exists for this test_id; choose a new test_id"}
-exit=1
-
-################ native bench (observatory ceiling, generator not involved)
-[crash] 10:42:01 kill -9 pid 15869
-[crash] 10:42:12 service back: {"ok":true,"queue":6,"writer_alive":true}
-{"test_id": "final-bench", "processes": 16, "batch_size": 100, "seconds": 30.5, "acked_batches": 1560, "acked_objects": 156000, "errors": 15880, "objects_per_s": 5122, "batches_per_s": 51, "latency_ms_p50": 192.4, "p99": 446.2, "max": 654.2}
+################ docker run --rm --network host -v /root/explore/out:/probe:ro -i python:3.11-slim python -I - /probe/probe.jsonl http://127.0.0.1:8000 bench-104732 16 30 100
+{"test_id": "bench-104732", "processes": 16, "batch_size": 100, "seconds": 30.3, "acked_batches": 2572, "acked_objects": 257200, "errors": 0, "objects_per_s": 8478, "batches_per_s": 85, "latency_ms_p50": 164.8, "p99": 489.6, "max": 1071.5}
+exit=0
 
 ################ storage after suite
-db_bytes 259329160 disk {'free_bytes': 1022180306944, 'budget_reached': False, 'max_db_bytes': 18253611008, 'min_free_bytes': 1073741824}
-CONTAINER ID   NAME                 CPU %     MEM USAGE / LIMIT   MEM %     NET I/O         BLOCK I/O    PIDS
-aa794b6fccb3   cosmos-observatory   0.19%     208.2MiB / 4GiB     5.08%     129MB / 718kB   0B / 118MB   7
+db_bytes 1469016608 disk {'free_bytes': 1020754681856, 'budget_reached': False, 'max_db_bytes': 18253611008, 'min_free_bytes': 1073741824}
+CONTAINER ID   NAME                 CPU %     MEM USAGE / LIMIT   MEM %     NET I/O          BLOCK I/O    PIDS
+9064c364b734   cosmos-observatory   0.20%     359.7MiB / 4GiB     8.78%     410MB / 1.79MB   0B / 452MB   9
+suite result: PASS
