@@ -91,3 +91,36 @@ select.full{width:100%}
 .mapdetail h2{font-size:16px}
 @media (max-width:1250px){.mapdesk{grid-template-columns:230px minmax(0,1fr)}.mapdetail{grid-column:1 / -1;max-height:none}}
 @media (max-width:900px){.mapdesk{grid-template-columns:1fr}.kpis-main{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* ---- immersive observation window (map tab) */
+main.full{max-width:none;padding:0}
+.observatory{position:relative;height:calc(100vh - 53px);min-height:520px;overflow:hidden;background:#02040a}
+.observatory #sky{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
+.observatory #sky:active{cursor:grabbing}
+.hud{position:absolute;z-index:3}
+.panel{background:rgba(6,11,22,.70);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);border:1px solid rgba(110,200,255,.16);border-radius:10px;padding:12px 14px;box-shadow:0 10px 30px rgba(0,0,0,.45);animation:hudin .28s ease}
+@keyframes hudin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.hud-left{left:14px;top:14px;width:240px;max-height:calc(100% - 60px);overflow:auto}
+.hud-top{left:270px;right:370px;top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;pointer-events:none}
+.hud-top .chip{pointer-events:auto}
+.hud-bottom{left:270px;right:14px;bottom:36px;pointer-events:none;text-align:left}
+.hud-right{right:14px;top:14px;width:350px;max-height:calc(100% - 60px);overflow:auto}
+.hud-right.hidden{display:none}
+.hud-right .close{position:sticky;float:right;top:0}
+.hudtext{color:#8fa6c8;font-size:12px;text-shadow:0 1px 3px #000}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.panel h3{color:#8fd6ff;font-size:12px;letter-spacing:.06em;margin:14px 0 6px;font-weight:600}
+.panel h3:first-child{margin-top:0}
+.panel .hint{font-size:11.5px}
+.observatory select{background:rgba(4,8,16,.8);border-color:rgba(110,200,255,.2)}
+.observatory .seg{border-color:rgba(110,200,255,.2)}
+.observatory .seg button{background:rgba(4,8,16,.6)}
+.observatory .seg button.on,.observatory .seg button:hover{background:rgba(70,180,255,.16);color:#d4efff}
+.observatory .lg span{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.observatory .lg:hover{background:rgba(70,180,255,.08)}
+.observatory .chip{background:rgba(70,180,255,.12);border-color:rgba(110,200,255,.4);color:#bfe6ff}
+.observatory .tip{background:rgba(4,8,16,.88);border:1px solid rgba(110,220,255,.45);color:#d7f0ff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;max-width:340px;box-shadow:0 0 12px rgba(110,220,255,.15)}
+.hud-right pre{background:rgba(2,5,12,.7);border-color:rgba(110,200,255,.14)}
+.hud-right .kv div:nth-child(even){font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+@media (max-width:1100px){.hud-top{right:14px}.hud-right{top:auto;bottom:60px;max-height:45%}}
+@media (max-width:760px){.hud-left{width:auto;right:14px;max-height:40%}.hud-top{left:14px;top:auto;bottom:90px}.hud-bottom{display:none}}

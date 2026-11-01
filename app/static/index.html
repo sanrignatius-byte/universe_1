@@ -60,29 +60,32 @@
 
   <!-- map -->
   <section id="map" class="tab">
-    <div class="mapdesk">
-      <aside class="card mapside">
+    <div class="observatory">
+      <canvas id="sky"></canvas>
+      <div id="tip" class="tip hidden"></div>
+      <div class="hud hud-left panel">
         <h3>参考系</h3>
         <select id="frame" class="full"></select>
-        <p class="hint">一次只画一个参考系（类型 · ID · 单位）。不同局部坐标系之间没有已知变换，不合并显示。</p>
+        <p class="hint">一次只看一个参考系（类型 · ID · 单位）。局部坐标系之间没有已知变换，不合并显示。</p>
         <h3>投影</h3>
         <div class="seg" id="projSeg"><button data-proj="xy" class="on">X–Y</button><button data-proj="xz">X–Z</button><button data-proj="yz">Y–Z</button></div>
         <h3>视图</h3>
         <div class="seg"><button id="fit">适应全部</button><button id="resetView">重置</button></div>
         <label class="chk"><input type="checkbox" id="mapAuto" checked> 自动刷新（6 秒，保留视野）</label>
-        <div class="hint" id="mapUpdated"></div>
+        <label class="chk"><input type="checkbox" id="mapGrid" checked> 坐标网格</label>
+        <div class="hint mono" id="mapUpdated"></div>
         <h3>类别 <small>点击显示 / 隐藏</small></h3>
         <div id="legend" class="legend col"></div>
-      </aside>
-      <div class="card mapmain">
-        <div class="toolbar maptool">
-          <span id="mapFilter" class="chip hidden"></span>
-          <span id="mapCount" class="hint"></span>
-        </div>
-        <div class="mapwrap"><canvas id="sky"></canvas><div id="tip" class="tip hidden"></div></div>
-        <div class="hint">滚轮缩放（以光标为中心）· 拖动平移 · 点击光点查看详情 · 颜色 = 一级类别（各页面一致）</div>
       </div>
-      <aside class="card mapdetail" id="mapDetail"><p class="hint">点击星图上的光点，在这里查看对象详情。</p></aside>
+      <div class="hud hud-top">
+        <span id="mapFilter" class="chip hidden"></span>
+        <span id="mapCount" class="hudtext mono"></span>
+      </div>
+      <div class="hud hud-bottom hudtext">滚轮缩放 · 拖动平移 · 点击星点锁定目标 · 背景星尘与星云只是装饰（固定在屏幕上，不随视图移动，不可点击），所有星点都是真实对象的真实坐标</div>
+      <aside class="hud hud-right panel hidden" id="mapDetailWrap">
+        <button class="close" id="mdClose" title="关闭">✕</button>
+        <div id="mapDetail"></div>
+      </aside>
     </div>
   </section>
 

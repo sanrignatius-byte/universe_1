@@ -26,6 +26,7 @@ document.querySelectorAll("#tabs button").forEach((b) => b.onclick = () => {
   document.querySelectorAll("#tabs button").forEach((x) => x.classList.toggle("on", x === b));
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.id === b.dataset.tab));
   S.tab = b.dataset.tab;
+  document.querySelector("main").classList.toggle("full", S.tab === "map");
   refresh(true);
 });
 
@@ -214,12 +215,14 @@ async function showObject(id) {
 $("#mclose").onclick = () => $("#modal").classList.add("hidden");
 $("#modal").onclick = (e) => { if (e.target.id === "modal") $("#modal").classList.add("hidden"); };
 
-// ---------------------------------------------------------------- map (observation desk)
-// projections: [index of horizontal coord, index of vertical coord, labels] into points [seq, type, x, y, z]
+// ---------------------------------------------------------------- map (immersive observation window)
+// Real coordinates only: decorative star dust is fixed to the screen (it never pans/zooms and is not
+// clickable), data stars move with the view. projections index into points [seq, type, x, y, z].
 const AX = { xy: [2, 3, "X", "Y"], xz: [2, 4, "X", "Z"], yz: [3, 4, "Y", "Z"] };
 const M = { pts: [], frames: [], frame: null, window: 0, proj: "xy", view: null, key: "", hidden: new Set(),
-            sel: null, hover: null, drag: null, updated: null, loading: false, toScreen: null };
-const MAP_HINT = `<p class="hint">点击星图上的光点，在这里查看对象详情。</p>`;
+            sel: null, hover: null, drag: null, updated: null, loading: false, toScreen: null, grid: true,
+            base: document.createElement("canvas"), raf: 0 };
+const MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 const frameKey = (f) => (f ? `${f.frame_kind}|${f.frame_id}|${f.unit}` : "");
 const mapKey = () => `${frameKey(M.frame)}|${M.proj}|${S.sel ?? ""}`;
 const fmtAxis = (v) => (v !== 0 && (Math.abs(v) >= 1e7 || Math.abs(v) < 1e-2) ? v.toExponential(1) : fmt(Math.round(v * 100) / 100));
@@ -241,7 +244,7 @@ async function renderMap(keepView) {
     M.pts = d.points;
     M.updated = new Date();
     const k = mapKey();
-    if (!keepView || k !== M.key) { M.view = null; M.sel = null; }   // new frame / projection / filter: fit again
+    if (!keepView || k !== M.key) { M.view = null; M.sel = null; $("#mapDetailWrap").classList.add("hidden"); }
     M.key = k;
     $("#frame").innerHTML = d.frames.map((f, i) => `<option value="${i}" ${frameKey(f) === frameKey(d.frame) ? "selected" : ""}>${esc(f.frame_kind)} · ${esc(f.frame_id)} · ${esc(f.unit)}（累计 ${fmt(f.n)}）</option>`).join("");
     renderMapChrome();
@@ -260,14 +263,14 @@ function renderMapChrome() {
   const total = f ? (M.frames.find((x) => frameKey(x) === frameKey(f))?.n ?? 0) : 0;
   const shown = M.pts.filter((p) => !M.hidden.has(topId(p[1]))).length;
   $("#mapCount").textContent = f
-    ? `本次显示 ${fmt(shown)} 个点（取样 ${fmt(M.pts.length)}：该参考系最新 ${fmt(M.window)} 个对象序号窗口内最多 20,000 点）· 该参考系累计 ${fmt(total)} 个对象`
+    ? `${f.frame_kind} · ${f.frame_id} · ${f.unit}　本次显示 ${fmt(shown)} 点 · 取样 ${fmt(M.pts.length)}（最新 ${fmt(M.window)} 个对象序号窗口内最多 20,000 点）· 累计 ${fmt(total)} 个对象`
     : "这一轮没有带坐标的对象";
   $("#mapUpdated").textContent = M.updated ? `最后更新 ${M.updated.toTimeString().slice(0, 8)}` : "";
   const cnt = new Map();
   for (const p of M.pts) { const t = topId(p[1]); cnt.set(t, (cnt.get(t) || 0) + 1); }
   const tops = [...cnt.keys()].sort((a, b) => cnt.get(b) - cnt.get(a));
   $("#legend").innerHTML = tops.map((t) => `<button class="lg ${M.hidden.has(t) ? "off" : ""}" data-top="${t}" title="点击显示/隐藏">
-      <i style="background:${catColor(t)}"></i><b>${esc(S.tree?.by.get(t)?.name ?? "#" + t)}</b><span>${fmt(cnt.get(t))}</span></button>`).join("")
+      <i style="background:${catColor(t)};box-shadow:0 0 6px ${catColor(t)}"></i><b>${esc(S.tree?.by.get(t)?.name ?? "#" + t)}</b><span>${fmt(cnt.get(t))}</span></button>`).join("")
     || `<p class="hint">无</p>`;
 }
 
@@ -280,73 +283,146 @@ function fitView(W, H) {
     if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
   }
   if (!n) return { cx: 0, cy: 0, k: 1 };
-  const pad = 40, dx = (x1 - x0) || 1, dy = (y1 - y0) || 1;
-  return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, k: Math.min((W - 2 * pad) / dx, (H - 2 * pad) / dy) };
+  // leave room for the floating panels on the left and right
+  const padX = Math.min(300, W * 0.2), padY = 60, dx = (x1 - x0) || 1, dy = (y1 - y0) || 1;
+  return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, k: Math.max(1e-12, Math.min((W - 2 * padX) / dx, (H - 2 * padY) / dy)) };
 }
 
+// decorative deep-space background, cached per canvas size (deterministic, dim, screen-fixed)
+const SKYBG = { w: 0, h: 0, d: 0, c: null };
+function skyBackground(W, H, dpr) {
+  if (SKYBG.c && SKYBG.w === W && SKYBG.h === H && SKYBG.d === dpr) return SKYBG.c;
+  const c = document.createElement("canvas");
+  c.width = Math.round(W * dpr); c.height = Math.round(H * dpr);
+  const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const base = g.createLinearGradient(0, 0, 0, H);
+  base.addColorStop(0, "#02040a"); base.addColorStop(1, "#050915");
+  g.fillStyle = base; g.fillRect(0, 0, W, H);
+  const R = Math.max(W, H);
+  const neb = (x, y, r, col) => { const gr = g.createRadialGradient(x, y, 0, x, y, r); gr.addColorStop(0, col); gr.addColorStop(1, "rgba(0,0,0,0)"); g.fillStyle = gr; g.fillRect(0, 0, W, H); };
+  neb(W * 0.22, H * 0.28, R * 0.45, "rgba(78,64,150,0.10)");
+  neb(W * 0.80, H * 0.74, R * 0.42, "rgba(36,96,160,0.08)");
+  neb(W * 0.58, H * 0.10, R * 0.30, "rgba(120,60,130,0.05)");
+  let seed = 20261101;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const n = Math.round((W * H) / 2400);
+  for (let i = 0; i < n; i++) {
+    const x = rnd() * W, y = rnd() * H, a = 0.04 + rnd() * 0.16, s = rnd() < 0.93 ? 0.7 : 1.2;
+    g.fillStyle = `rgba(205,214,240,${a.toFixed(3)})`; g.fillRect(x, y, s, s);
+  }
+  Object.assign(SKYBG, { w: W, h: H, d: dpr, c });
+  return c;
+}
+
+// base layer: background, grid, data stars, axes (redrawn only when data or view change)
 function drawMap() {
   const cv = $("#sky"), dpr = window.devicePixelRatio || 1;
   const W = cv.clientWidth, H = cv.clientHeight;
   if (!W || !H) return;
-  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
-  const g = cv.getContext("2d");
+  for (const c of [cv, M.base]) {
+    if (c.width !== Math.round(W * dpr) || c.height !== Math.round(H * dpr)) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
+  }
+  const g = M.base.getContext("2d");
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(skyBackground(W, H, dpr), 0, 0);
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  g.fillStyle = "#070b13"; g.fillRect(0, 0, W, H);
   const f = M.frame;
-  if (!f || !M.pts.length) { M.toScreen = null; g.fillStyle = "#8a97b6"; g.font = "13px sans-serif"; g.fillText("该参考系暂无对象", 20, 30); return; }
+  if (!f || !M.pts.length) {
+    M.toScreen = null; g.fillStyle = "#8a97b6"; g.font = "14px sans-serif"; g.fillText("该参考系暂无对象", W / 2 - 60, H / 2);
+    composite(); return;
+  }
   if (!M.view) M.view = fitView(W, H);
   const { cx, cy, k } = M.view, [ix, iy, ax, ay] = AX[M.proj];
   const sx = (x) => W / 2 + (x - cx) * k, sy = (y) => H / 2 - (y - cy) * k;
   M.toScreen = (p) => [sx(p[ix]), sy(p[iy])];
-  // grid, tick labels, origin
-  const step = niceStep(90 / k);
+  const step = niceStep(110 / k);
   const xa = cx - W / 2 / k, xb = cx + W / 2 / k, ya = cy - H / 2 / k, yb = cy + H / 2 / k;
-  g.lineWidth = 1; g.strokeStyle = "rgba(148,163,196,0.09)"; g.beginPath();
-  for (let x = Math.ceil(xa / step) * step; x <= xb; x += step) { const X = Math.round(sx(x)) + 0.5; g.moveTo(X, 0); g.lineTo(X, H); }
-  for (let y = Math.ceil(ya / step) * step; y <= yb; y += step) { const Y = Math.round(sy(y)) + 0.5; g.moveTo(0, Y); g.lineTo(W, Y); }
-  g.stroke();
-  g.font = "11px sans-serif"; g.fillStyle = "#5f6d8c";
-  for (let x = Math.ceil(xa / step) * step; x <= xb; x += step) g.fillText(fmtAxis(x), sx(x) + 3, H - 6);
-  for (let y = Math.ceil(ya / step) * step; y <= yb; y += step) g.fillText(fmtAxis(y), 4, sy(y) - 3);
+  if (M.grid) {
+    g.lineWidth = 1; g.strokeStyle = "rgba(120,190,255,0.06)"; g.beginPath();
+    for (let x = Math.ceil(xa / step) * step; x <= xb; x += step) { const X = Math.round(sx(x)) + 0.5; g.moveTo(X, 0); g.lineTo(X, H); }
+    for (let y = Math.ceil(ya / step) * step; y <= yb; y += step) { const Y = Math.round(sy(y)) + 0.5; g.moveTo(0, Y); g.lineTo(W, Y); }
+    g.stroke();
+    g.font = `10px ${MONO}`; g.fillStyle = "rgba(140,170,210,0.45)";
+    for (let x = Math.ceil(xa / step) * step; x <= xb; x += step) g.fillText(fmtAxis(x), sx(x) + 3, H - 30);
+    for (let y = Math.ceil(ya / step) * step; y <= yb; y += step) g.fillText(fmtAxis(y), W / 2 > 300 ? 270 : 6, sy(y) - 3);
+  }
   if (xa <= 0 && 0 <= xb && ya <= 0 && 0 <= yb) {
     const X = sx(0), Y = sy(0);
-    g.strokeStyle = "rgba(245,184,75,0.55)"; g.beginPath(); g.moveTo(X - 9, Y); g.lineTo(X + 9, Y); g.moveTo(X, Y - 9); g.lineTo(X, Y + 9); g.stroke();
-    g.fillStyle = "rgba(245,184,75,0.85)"; g.fillText("原点", X + 6, Y - 6);
+    g.strokeStyle = "rgba(245,184,75,0.45)"; g.lineWidth = 1; g.beginPath(); g.moveTo(X - 10, Y); g.lineTo(X + 10, Y); g.moveTo(X, Y - 10); g.lineTo(X, Y + 10); g.stroke();
+    g.fillStyle = "rgba(245,184,75,0.75)"; g.font = `10px ${MONO}`; g.fillText("原点 (0,0)", X + 6, Y - 6);
   }
-  // points: soft round dots, grouped by colour (no additive blending, so dense areas keep their colour)
-  const groups = new Map(), r = 1.9;
+  // data stars: soft halo + bright core, per colour (source-over keeps dense regions coloured, not white)
+  const groups = new Map();
   for (const p of M.pts) {
     const t = topId(p[1]);
     if (M.hidden.has(t)) continue;
     const X = sx(p[ix]), Y = sy(p[iy]);
-    if (X < -4 || Y < -4 || X > W + 4 || Y > H + 4) continue;
+    if (X < -6 || Y < -6 || X > W + 6 || Y > H + 6) continue;
     const c = catColor(t);
     let a = groups.get(c); if (!a) groups.set(c, (a = []));
     a.push(X, Y);
   }
-  g.globalAlpha = 0.55;
-  for (const [c, a] of groups) {
-    g.fillStyle = c; g.beginPath();
-    for (let i = 0; i < a.length; i += 2) { g.moveTo(a[i] + r, a[i + 1]); g.arc(a[i], a[i + 1], r, 0, 6.2832); }
-    g.fill();
-  }
-  g.globalAlpha = 1;
-  const ring = (p, color, rad, glow) => {
-    const [X, Y] = M.toScreen(p); g.save();
-    if (glow) { g.shadowColor = color; g.shadowBlur = 14; }
-    g.strokeStyle = color; g.lineWidth = 2; g.beginPath(); g.arc(X, Y, rad, 0, 6.2832); g.stroke(); g.restore();
+  const pass = (rad, alpha) => {
+    g.globalAlpha = alpha;
+    for (const [c, a] of groups) {
+      g.fillStyle = c; g.beginPath();
+      for (let i = 0; i < a.length; i += 2) { g.moveTo(a[i] + rad, a[i + 1]); g.arc(a[i], a[i + 1], rad, 0, 6.2832); }
+      g.fill();
+    }
   };
-  if (M.hover && M.hover !== M.sel) ring(M.hover, "#ffffff", 5, false);
-  if (M.sel) ring(M.sel, "#f5b84b", 7, true);
-  // axis names and scale bar (top right)
-  g.fillStyle = "#9aa7c4"; g.font = "12px sans-serif";
-  g.fillText(`${ax} →`, W - 34, H - 20); g.fillText(`↑ ${ay}`, 8, 16);
-  const bar = step * k, bx = W - 18 - bar;
-  g.strokeStyle = "#cbd5e1"; g.lineWidth = 2; g.beginPath(); g.moveTo(bx, 22); g.lineTo(bx + bar, 22); g.moveTo(bx, 17); g.lineTo(bx, 27); g.moveTo(bx + bar, 17); g.lineTo(bx + bar, 27); g.stroke();
-  g.fillText(`${fmtAxis(step)} ${f.unit}`, bx, 14);
+  pass(3.6, 0.09);   // halo
+  pass(1.35, 0.92);  // core
+  g.globalAlpha = 0.85; g.fillStyle = "#ffffff";   // pin-point highlight in each core
+  for (const a of groups.values()) for (let i = 0; i < a.length; i += 2) g.fillRect(a[i] - 0.35, a[i + 1] - 0.35, 0.7, 0.7);
+  g.globalAlpha = 1;
+  // axis names and scale bar (bottom centre)
+  g.fillStyle = "rgba(160,190,225,0.8)"; g.font = `11px ${MONO}`;
+  g.fillText(`${ax} →`, W - 380 > W / 2 ? W - 380 : W - 60, H - 14); g.fillText(`↑ ${ay}`, W / 2, 16);
+  const bar = step * k, bx = W / 2 - bar / 2, by = H - 16;
+  g.strokeStyle = "rgba(200,225,255,0.75)"; g.lineWidth = 1.5; g.beginPath();
+  g.moveTo(bx, by); g.lineTo(bx + bar, by); g.moveTo(bx, by - 4); g.lineTo(bx, by + 4); g.moveTo(bx + bar, by - 4); g.lineTo(bx + bar, by + 4); g.stroke();
+  g.fillText(`${fmtAxis(step)} ${f.unit}`, bx + bar + 8, by + 4);
+  composite();
 }
 
-function pickAt(mx, my, rad = 8) {
+// top layer: base + locator ring (hover) + breathing target lock (selection); cheap enough per frame
+function composite(t) {
+  const cv = $("#sky"), dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  const g = cv.getContext("2d");
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(M.base, 0, 0);
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!M.toScreen) return;
+  if (M.hover && M.hover !== M.sel) {
+    const [X, Y] = M.toScreen(M.hover);
+    g.strokeStyle = "rgba(110,220,255,0.9)"; g.lineWidth = 1.2; g.beginPath(); g.arc(X, Y, 7, 0, 6.2832);
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { g.moveTo(X + dx * 9, Y + dy * 9); g.lineTo(X + dx * 14, Y + dy * 14); }
+    g.stroke();
+  }
+  if (M.sel) {
+    const [X, Y] = M.toScreen(M.sel), ph = ((t ?? performance.now()) / 650) % 6.2832;
+    const r = 10 + 2.5 * Math.sin(ph), a = 0.55 + 0.35 * Math.sin(ph);
+    g.save(); g.shadowColor = "#f5b84b"; g.shadowBlur = 16;
+    g.strokeStyle = `rgba(245,184,75,${a.toFixed(2)})`; g.lineWidth = 1.6; g.beginPath(); g.arc(X, Y, r, 0, 6.2832); g.stroke();
+    g.restore();
+    g.strokeStyle = "rgba(245,184,75,0.9)"; g.lineWidth = 1.4; g.beginPath();   // corner brackets
+    const s = 16, l = 5;
+    for (const [sx2, sy2] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      g.moveTo(X + sx2 * s, Y + sy2 * (s - l)); g.lineTo(X + sx2 * s, Y + sy2 * s); g.lineTo(X + sx2 * (s - l), Y + sy2 * s);
+    }
+    g.stroke();
+  }
+}
+function pulse() {
+  M.raf = 0;
+  if (S.tab !== "map" || !M.sel || document.hidden) return;
+  composite(performance.now());
+  M.raf = requestAnimationFrame(pulse);
+}
+const startPulse = () => { if (!M.raf) M.raf = requestAnimationFrame(pulse); };
+
+function pickAt(mx, my, rad = 9) {
   if (!M.toScreen) return null;
   let best = null, bd = rad * rad;
   for (const p of M.pts) {
@@ -357,6 +433,9 @@ function pickAt(mx, my, rad = 8) {
   return best;
 }
 async function showMapDetail(id) {
+  const wrap = $("#mapDetailWrap");
+  wrap.classList.remove("hidden");
+  $("#mapDetail").innerHTML = `<p class="hint">读取 ${esc(id)} …</p>`;
   try { $("#mapDetail").innerHTML = objectHtml(await api("/api/object/" + encodeURIComponent(id))); }
   catch (e) { $("#mapDetail").innerHTML = `<p class="badge bad">${esc(e.message)}</p>`; }
 }
@@ -376,7 +455,7 @@ window.addEventListener("mouseup", (e) => {
   const d = M.drag; M.drag = null;
   if (!d || d.moved || S.tab !== "map") return;
   const [mx, my] = rel(e), p = pickAt(mx, my);
-  if (p) { M.sel = p; drawMap(); showMapDetail(`${S.test}-${p[0]}`); }
+  if (p) { M.sel = p; composite(); startPulse(); showMapDetail(`${S.test}-${p[0]}`); }
 });
 sky.addEventListener("mousemove", (e) => {
   const [mx, my] = rel(e), d = M.drag;
@@ -387,16 +466,16 @@ sky.addEventListener("mousemove", (e) => {
     return;
   }
   const p = pickAt(mx, my);
-  if (p !== M.hover) { M.hover = p; drawMap(); }
+  if (p !== M.hover) { M.hover = p; composite(); }
   const tip = $("#tip");
   if (p) {
     const [ix, iy] = AX[M.proj], n = S.tree?.by.get(p[1]);
-    tip.textContent = `${S.test}-${p[0]} · ${n ? n.name : "#" + p[1]} · (${fmtAxis(p[ix])}, ${fmtAxis(p[iy])}) ${M.frame?.unit ?? ""}`;
-    tip.style.left = Math.max(0, Math.min(mx + 14, sky.clientWidth - 280)) + "px"; tip.style.top = my + 12 + "px";
+    tip.textContent = `${n ? n.name : "#" + p[1]}  ·  ${S.test}-${p[0]}  ·  (${fmtAxis(p[ix])}, ${fmtAxis(p[iy])}) ${M.frame?.unit ?? ""}`;
+    tip.style.left = Math.max(0, Math.min(mx + 16, sky.clientWidth - 330)) + "px"; tip.style.top = my + 14 + "px";
     tip.classList.remove("hidden");
   } else tip.classList.add("hidden");
 });
-sky.addEventListener("mouseleave", () => { $("#tip").classList.add("hidden"); if (M.hover) { M.hover = null; drawMap(); } });
+sky.addEventListener("mouseleave", () => { $("#tip").classList.add("hidden"); if (M.hover) { M.hover = null; composite(); } });
 $("#frame").onchange = () => { M.frame = M.frames[Number($("#frame").value)]; renderMap(false); };
 document.querySelectorAll("#projSeg button").forEach((b) => b.onclick = () => {
   M.proj = b.dataset.proj;
@@ -404,7 +483,9 @@ document.querySelectorAll("#projSeg button").forEach((b) => b.onclick = () => {
   M.view = null; M.key = mapKey(); drawMap();
 });
 $("#fit").onclick = () => { M.view = null; drawMap(); };
-$("#resetView").onclick = () => { M.view = null; M.hidden.clear(); M.sel = null; $("#mapDetail").innerHTML = MAP_HINT; renderMapChrome(); drawMap(); };
+$("#resetView").onclick = () => { M.view = null; M.hidden.clear(); M.sel = null; $("#mapDetailWrap").classList.add("hidden"); renderMapChrome(); drawMap(); };
+$("#mapGrid").onchange = () => { M.grid = $("#mapGrid").checked; drawMap(); };
+$("#mdClose").onclick = () => { M.sel = null; $("#mapDetailWrap").classList.add("hidden"); composite(); };
 $("#legend").onclick = (e) => {
   const b = e.target.closest("button[data-top]"); if (!b) return;
   const t = Number(b.dataset.top);
