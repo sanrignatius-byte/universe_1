@@ -24,7 +24,11 @@ if ! docker ps --format '{{.Names}}' | grep -qx object-source; then
   sleep 2
 fi
 
-bash "$here/gen.sh" start "$id" http://host.docker.internal:8000/ingest "$rate" "$dur" "$batch" "$workers" "$profile"
+[ "$rate" = 0 ] && export RAMP=0   # generator requires ramp 0 for best-effort mode
+out=$(bash "$here/gen.sh" start "$id" http://host.docker.internal:8000/ingest "$rate" "$dur" "$batch" "$workers" "$profile")
+echo "$out" | head -c 300; echo
+if echo "$out" | grep -q '"error"'; then echo "generator refused to start"; exit 1; fi
+sleep 2
 while true; do
   s=$(curl -sS http://127.0.0.1:9001/status)
   state=$(echo "$s" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')

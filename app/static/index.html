@@ -1,1 +1,105 @@
-<!doctype html><html><body>loading</body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>宇宙万物观测站</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/vendor/echarts.min.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand">🔭 宇宙万物观测站 <span class="sub">Cosmos Observatory</span></div>
+  <nav id="tabs">
+    <button data-tab="overview" class="on">总览</button>
+    <button data-tab="explore">万物目录</button>
+    <button data-tab="map">星图</button>
+    <button data-tab="evolve">演化</button>
+    <button data-tab="trust">数据可信</button>
+  </nav>
+  <div class="right">
+    <label>观测轮次 <select id="test"></select></label>
+    <span id="live" class="dot" title="自动刷新"></span>
+  </div>
+</header>
+
+<main>
+  <!-- overview -->
+  <section id="overview" class="tab on">
+    <div class="kpis" id="kpis"></div>
+    <div class="grid2">
+      <div class="card"><h3>实时摄入（对象/秒，按提交时间）</h3><div id="rateChart" class="chart"></div></div>
+      <div class="card"><h3>世界构成（一级类别）</h3><div id="catChart" class="chart"></div></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h3>写入引擎</h3><div id="writer" class="kv"></div></div>
+      <div class="card"><h3>最近拒收的消息</h3><div id="rejectsMini" class="tablewrap"></div></div>
+    </div>
+  </section>
+
+  <!-- explore -->
+  <section id="explore" class="tab">
+    <div class="split">
+      <aside class="card treecard">
+        <h3>类型树 <small id="treeInfo"></small></h3>
+        <input id="treeFilter" placeholder="过滤类型名…">
+        <div id="tree"></div>
+      </aside>
+      <div class="card">
+        <div class="toolbar">
+          <span id="crumb" class="crumb">全部对象</span>
+          <input id="q" placeholder="按名称搜索，或输入完整对象 ID">
+          <button id="qGo">搜索</button>
+        </div>
+        <div class="tablewrap"><table id="objTable"><thead><tr>
+          <th>ID</th><th>名称</th><th>类型</th><th>观测时间</th><th>坐标系</th><th>位置</th></tr></thead><tbody></tbody></table></div>
+        <button id="more" class="more">加载更多</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- map -->
+  <section id="map" class="tab">
+    <div class="card">
+      <div class="toolbar">
+        <label>坐标系 <select id="frame"></select></label>
+        <label>投影 <select id="proj"><option value="xy">X–Y</option><option value="xz">X–Z</option></select></label>
+        <span class="hint">最近 20,000 个对象；点击光点查看详情；颜色 = 一级类别</span>
+      </div>
+      <div class="mapwrap"><canvas id="sky"></canvas></div>
+      <div id="legend" class="legend"></div>
+    </div>
+  </section>
+
+  <!-- evolution -->
+  <section id="evolve" class="tab">
+    <div class="grid2">
+      <div class="card"><h3>类型树修订（每个修订的变更数）</h3><div id="revChart" class="chart"></div></div>
+      <div class="card"><h3>结构变化：重命名 / 移动</h3><div id="changes" class="tablewrap"></div></div>
+    </div>
+    <div class="card"><h3>新出现的字段（按首次出现的对象序号倒序）</h3><div id="fields" class="tablewrap"></div></div>
+  </section>
+
+  <!-- trust -->
+  <section id="trust" class="tab">
+    <div class="grid2">
+      <div class="card">
+        <h3>与发生器运行记录对账</h3>
+        <p class="hint">上传发生器的 receipt JSON（<code>curl http://127.0.0.1:9001/receipt</code>）。系统逐批核对：发生器认为已确认的每一批是否都已落盘、故障批是否全部拒收、重复批是否只存一次。</p>
+        <input type="file" id="receipt" accept=".json,application/json">
+        <div id="recon"></div>
+      </div>
+      <div class="card"><h3>质量计数（本轮）</h3><div id="quality" class="kv"></div></div>
+    </div>
+    <div class="card"><h3>隔离区：被拒收的消息</h3><div id="rejects" class="tablewrap"></div></div>
+  </section>
+</main>
+
+<div id="modal" class="modal hidden"><div class="box">
+  <button class="close" id="mclose">✕</button>
+  <div id="mbody"></div>
+</div></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
