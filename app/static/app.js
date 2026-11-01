@@ -4,9 +4,14 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 const fmt = (n) => (n == null ? "–" : Number(n).toLocaleString("zh-CN"));
 const bytes = (n) => (n > 1 << 30 ? (n / (1 << 30)).toFixed(2) + " GiB" : (n / (1 << 20)).toFixed(1) + " MiB");
 const ts = (ms) => (ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 19) : "–");
-const PALETTE = ["#6ea8fe", "#3ecf8e", "#f5b84b", "#ff6b6b", "#c084fc", "#2dd4bf", "#f472b6", "#a3e635", "#fb923c", "#60a5fa", "#e879f9", "#facc15", "#94a3b8"];
+const PALETTE = ["#9bc6e9", "#99ceba", "#d9c294", "#d6a3a8", "#b4ade0", "#88cbd3", "#c5a3c7", "#bbcda5", "#d5b19a", "#8bb9dd", "#c3b0e3", "#d2cc9f", "#a7bdcd"];
 
-const S = { test: null, tab: "overview", tree: null, sel: null, next: null, mapPts: [], charts: {} };
+const S = { test: null, tab: "map", tree: null, sel: null, next: null, mapPts: [], charts: {} };
+document.body.classList.add("sky-page");
+new ResizeObserver(([entry]) => {
+  document.documentElement.style.setProperty("--header-height", `${entry.target.getBoundingClientRect().height}px`);
+  if (S.tab === "map" && typeof drawMap === "function") requestAnimationFrame(drawMap);
+}).observe(document.querySelector("header"));
 
 async function api(path, opt) {
   const r = await fetch(path, opt);
@@ -27,7 +32,9 @@ document.querySelectorAll("#tabs button").forEach((b) => b.onclick = () => {
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.id === b.dataset.tab));
   S.tab = b.dataset.tab;
   document.querySelector("main").classList.toggle("full", S.tab === "map");
+  document.body.classList.toggle("sky-page", S.tab === "map");
   refresh(true);
+  requestAnimationFrame(() => Object.values(S.charts).forEach((c) => c.resize()));
 });
 
 async function loadTests() {
@@ -45,7 +52,9 @@ $("#test").onchange = () => { S.test = $("#test").value; S.tree = null; S.sel = 
 // ---------------------------------------------------------------- tree helpers
 async function loadTree(force) {
   if (S.tree && !force && !S.treeStale) return S.tree;
+  const requestedTest = S.test;
   const d = await api("/api/tree?" + qs({ test: S.test }));
+  if (requestedTest !== S.test) return null;
   const by = new Map(), kids = new Map();
   d.nodes.forEach((n) => { by.set(n.id, n); if (!kids.has(n.parent)) kids.set(n.parent, []); kids.get(n.parent).push(n.id); });
   const total = new Map();
@@ -220,11 +229,14 @@ $("#modal").onclick = (e) => { if (e.target.id === "modal") $("#modal").classLis
 // clickable), data stars move with the view. projections index into points [seq, type, x, y, z].
 const AX = { xy: [2, 3, "X", "Y"], xz: [2, 4, "X", "Z"], yz: [3, 4, "Y", "Z"] };
 const M = { pts: [], frames: [], frame: null, window: 0, proj: "xy", view: null, key: "", hidden: new Set(),
-            sel: null, hover: null, drag: null, updated: null, loading: false, toScreen: null, grid: true,
+            sel: null, hover: null, drag: null, updated: null, loading: false, toScreen: null, grid: false,
+            atmosphere: true, markers: [], picked: [], detailRequest: 0, pendingMap: false,
+            grouped: [], groupSource: null, groupTree: null, groupKey: "",
             base: document.createElement("canvas"), raf: 0 };
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 const frameKey = (f) => (f ? `${f.frame_kind}|${f.frame_id}|${f.unit}` : "");
-const mapKey = () => `${frameKey(M.frame)}|${M.proj}|${S.sel ?? ""}`;
+const mapKey = () => `${S.test}|${frameKey(M.frame)}|${M.proj}|${S.sel ?? ""}`;
 const fmtAxis = (v) => (v !== 0 && (Math.abs(v) >= 1e7 || Math.abs(v) < 1e-2) ? v.toExponential(1) : fmt(Math.round(v * 100) / 100));
 function niceStep(raw) {
   const e = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / e;
@@ -232,24 +244,39 @@ function niceStep(raw) {
 }
 
 async function renderMap(keepView) {
-  if (M.loading) return;
+  if (M.loading) { M.pendingMap = true; return; }
   M.loading = true;
+  const requestedTest = S.test;
+  const requestedFrame = frameKey(M.frame), requestedType = S.sel;
+  const superseded = () => requestedTest !== S.test || requestedFrame !== frameKey(M.frame) || requestedType !== S.sel;
+  let accepted = false;
   try {
     await loadTree(false);
     const cur = M.frame || {};
     const d = await api("/api/map?" + qs({ test: S.test, kind: cur.frame_kind, frame_id: cur.frame_id, unit: cur.unit, type: S.sel, limit: 20000 }));
+    if (superseded()) return;
     M.frames = d.frames;
     M.frame = d.frame;
+    accepted = true;
     M.window = d.window || 0;
     M.pts = d.points;
     M.updated = new Date();
     const k = mapKey();
-    if (!keepView || k !== M.key) { M.view = null; M.sel = null; $("#mapDetailWrap").classList.add("hidden"); }
+    if (!keepView || k !== M.key) { M.view = null; M.sel = null; M.hover = null; M.detailRequest++; $("#mapDetailWrap").classList.add("hidden"); $("#tip").classList.add("hidden"); }
     M.key = k;
-    $("#frame").innerHTML = d.frames.map((f, i) => `<option value="${i}" ${frameKey(f) === frameKey(d.frame) ? "selected" : ""}>${esc(f.frame_kind)} · ${esc(f.frame_id)} · ${esc(f.unit)}（累计 ${fmt(f.n)}）</option>`).join("");
+    $("#frame").innerHTML = d.frames.map((f, i) => `<option value="${i}" ${frameKey(f) === frameKey(d.frame) ? "selected" : ""}>${esc(f.frame_id ?? f.frame_kind)} · ${esc(f.unit)}</option>`).join("");
+    $("#frame").title = d.frame ? `${d.frame.frame_kind} · ${d.frame.frame_id} · ${d.frame.unit}` : "暂无参考系";
+    $("#mapUpdated").parentElement.classList.remove("error");
     renderMapChrome();
     drawMap();
-  } finally { M.loading = false; }
+  } catch (err) {
+    $("#mapUpdated").textContent = "连接中断 · 保留最近一次观测";
+    $("#mapUpdated").parentElement.classList.add("error");
+    throw err;
+  } finally {
+    M.loading = false;
+    if (M.pendingMap || (!accepted && superseded())) { M.pendingMap = false; renderMap(false).catch(console.warn); }
+  }
 }
 
 function renderMapChrome() {
@@ -263,13 +290,17 @@ function renderMapChrome() {
   const total = f ? (M.frames.find((x) => frameKey(x) === frameKey(f))?.n ?? 0) : 0;
   const shown = M.pts.filter((p) => !M.hidden.has(topId(p[1]))).length;
   $("#mapCount").textContent = f
-    ? `${f.frame_kind} · ${f.frame_id} · ${f.unit}　本次显示 ${fmt(shown)} 点 · 取样 ${fmt(M.pts.length)}（最新 ${fmt(M.window)} 个对象序号窗口内最多 20,000 点）· 累计 ${fmt(total)} 个对象`
+    ? `${f.frame_kind} · ${f.frame_id} · ${f.unit}。已载入 ${fmt(M.pts.length)} 个对象，类别筛选后 ${fmt(shown)} 个。从本轮全局最新 ${fmt(M.window)} 个对象序号范围内，选取该参考系最多 20,000 个对象；参考系累计 ${fmt(total)} 个。`
     : "这一轮没有带坐标的对象";
-  $("#mapUpdated").textContent = M.updated ? `最后更新 ${M.updated.toTimeString().slice(0, 8)}` : "";
+  $("#mapLoaded").textContent = fmt(shown);
+  $("#mapLoaded").title = "已载入且未被类别筛选隐藏的对象数量";
+  $("#mapTotal").textContent = fmt(total);
+  $("#frameCaption").textContent = f ? `${f.frame_kind.toUpperCase()} / ${f.unit}` : "等待观测数据";
+  $("#mapUpdated").textContent = M.updated ? `${$("#mapAuto").checked ? "更新于" : "已暂停 ·"} ${M.updated.toTimeString().slice(0, 8)}` : "等待连接";
   const cnt = new Map();
   for (const p of M.pts) { const t = topId(p[1]); cnt.set(t, (cnt.get(t) || 0) + 1); }
   const tops = [...cnt.keys()].sort((a, b) => cnt.get(b) - cnt.get(a));
-  $("#legend").innerHTML = tops.map((t) => `<button class="lg ${M.hidden.has(t) ? "off" : ""}" data-top="${t}" title="点击显示/隐藏">
+  $("#legend").innerHTML = tops.map((t) => `<button class="lg ${M.hidden.has(t) ? "off" : ""}" data-top="${t}" aria-pressed="${!M.hidden.has(t)}" title="点击显示/隐藏">
       <i style="background:${catColor(t)};box-shadow:0 0 6px ${catColor(t)}"></i><b>${esc(S.tree?.by.get(t)?.name ?? "#" + t)}</b><span>${fmt(cnt.get(t))}</span></button>`).join("")
     || `<p class="hint">无</p>`;
 }
@@ -283,12 +314,15 @@ function fitView(W, H) {
     if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
   }
   if (!n) return { cx: 0, cy: 0, k: 1 };
-  // leave room for the floating panels on the left and right
-  const padX = Math.min(300, W * 0.2), padY = 60, dx = (x1 - x0) || 1, dy = (y1 - y0) || 1;
-  return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, k: Math.max(1e-12, Math.min((W - 2 * padX) / dx, (H - 2 * padY) / dy)) };
+  const sidebar = $(".scene-sidebar").getBoundingClientRect();
+  const left = W > 650 ? sidebar.right + 35 : 26, right = W > 650 ? 95 : 40;
+  const top = W > 650 ? 85 : 60, bottom = 145;
+  const dx = (x1 - x0) || 1, dy = (y1 - y0) || 1;
+  const k = Math.max(1e-12, Math.min(Math.max(50, W - left - right) / dx, Math.max(50, H - top - bottom) / dy));
+  return { cx: (x0 + x1) / 2 - (left - right) / (2 * k), cy: (y0 + y1) / 2 + (top - bottom) / (2 * k), k };
 }
 
-// decorative deep-space background, cached per canvas size (deterministic, dim, screen-fixed)
+// Decorative atmosphere is deterministic and cached. It never encodes object positions.
 const SKYBG = { w: 0, h: 0, d: 0, c: null };
 function skyBackground(W, H, dpr) {
   if (SKYBG.c && SKYBG.w === W && SKYBG.h === H && SKYBG.d === dpr) return SKYBG.c;
@@ -298,25 +332,63 @@ function skyBackground(W, H, dpr) {
   const base = g.createLinearGradient(0, 0, 0, H);
   base.addColorStop(0, "#02040a"); base.addColorStop(1, "#050915");
   g.fillStyle = base; g.fillRect(0, 0, W, H);
-  const R = Math.max(W, H);
-  const neb = (x, y, r, col) => { const gr = g.createRadialGradient(x, y, 0, x, y, r); gr.addColorStop(0, col); gr.addColorStop(1, "rgba(0,0,0,0)"); g.fillStyle = gr; g.fillRect(0, 0, W, H); };
-  neb(W * 0.22, H * 0.28, R * 0.45, "rgba(78,64,150,0.10)");
-  neb(W * 0.80, H * 0.74, R * 0.42, "rgba(36,96,160,0.08)");
-  neb(W * 0.58, H * 0.10, R * 0.30, "rgba(120,60,130,0.05)");
+  // Render a small multi-octave noise texture once, then upscale it. No per-frame noise work.
+  const fog = document.createElement("canvas");
+  fog.width = 520; fog.height = Math.min(520, Math.max(180, Math.round(520 * H / W)));
+  const fg = fog.getContext("2d"), pixels = fg.createImageData(fog.width, fog.height);
+  const hash = (x, y) => { let h = Math.imul(x, 374761393) + Math.imul(y, 668265263); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967295; };
+  const noise = (x, y) => {
+    const a = Math.floor(x), b = Math.floor(y), u = x - a, v = y - b;
+    const s = u * u * (3 - 2 * u), t = v * v * (3 - 2 * v);
+    const n0 = hash(a, b) * (1 - s) + hash(a + 1, b) * s;
+    const n1 = hash(a, b + 1) * (1 - s) + hash(a + 1, b + 1) * s;
+    return n0 * (1 - t) + n1 * t;
+  };
+  const fbm = (x, y) => noise(x, y) * .52 + noise(x * 2.1 + 9, y * 2.1) * .27 + noise(x * 4.3, y * 4.3 + 5) * .14 + noise(x * 8.7, y * 8.7) * .07;
+  for (let y = 0; y < fog.height; y++) for (let x = 0; x < fog.width; x++) {
+    const u = x / fog.width, v = y / fog.height;
+    const n = fbm(u * 5.5 + 12, v * 5.5 + 8);
+    const bend = .69 - u * .36 + Math.sin(u * 6.4) * .055;
+    const band = Math.exp(-Math.pow((v - bend + (n - .5) * .26) / .19, 2));
+    const grain = Math.max(0, n * 1.65 - .38);
+    const ridge = .5 + .5 * fbm(u * 11 + 71, v * 11 + 3);
+    const f = band * grain * ridge, warm = Math.exp(-Math.pow((u - .48) / .22, 2));
+    const edge = Math.min(1, Math.max(.12, u * 2.8));
+    const i = (y * fog.width + x) * 4;
+    pixels.data[i] = 3 + f * (35 + warm * 32) * edge;
+    pixels.data[i + 1] = 7 + f * (55 - warm * 15) * edge;
+    pixels.data[i + 2] = 16 + f * (92 + warm * 15) * edge;
+    pixels.data[i + 3] = 255;
+  }
+  fg.putImageData(pixels, 0, 0);
+  g.imageSmoothingEnabled = true; g.drawImage(fog, 0, 0, W, H);
   let seed = 20261101;
   const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-  const n = Math.round((W * H) / 2400);
+  const n = Math.min(2800, Math.round((W * H) / 1150));
   for (let i = 0; i < n; i++) {
-    const x = rnd() * W, y = rnd() * H, a = 0.04 + rnd() * 0.16, s = rnd() < 0.93 ? 0.7 : 1.2;
-    g.fillStyle = `rgba(205,214,240,${a.toFixed(3)})`; g.fillRect(x, y, s, s);
+    const x = rnd() * W, y = rnd() * H, a = 0.07 + rnd() * 0.28, s = rnd() < .9 ? .45 : .85;
+    g.fillStyle = `rgba(172,193,217,${a.toFixed(3)})`; g.beginPath(); g.arc(x, y, s, 0, Math.PI * 2); g.fill();
   }
+  const vignette = g.createRadialGradient(W * .57, H * .47, Math.min(W, H) * .15, W * .53, H * .50, Math.max(W, H) * .69);
+  vignette.addColorStop(0, "#02061000"); vignette.addColorStop(1, "#01040ca8");
+  g.fillStyle = vignette; g.fillRect(0, 0, W, H);
   Object.assign(SKYBG, { w: W, h: H, d: dpr, c });
   return c;
 }
 
-// base layer: background, grid, data stars, axes (redrawn only when data or view change)
+// Small cached sprites avoid constructing gradients for every object on every redraw.
+const starSprites = new Map();
+function starSprite(color) {
+  if (starSprites.has(color)) return starSprites.get(color);
+  const c = document.createElement("canvas"); c.width = c.height = 64;
+  const g = c.getContext("2d"), glow = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  glow.addColorStop(0, color + "ee"); glow.addColorStop(.12, color + "99"); glow.addColorStop(.3, color + "32"); glow.addColorStop(1, color + "00");
+  g.fillStyle = glow; g.fillRect(0, 0, 64, 64); starSprites.set(color, c); return c;
+}
+
+// Base layer: decorative background, optional grid and true projected positions.
 function drawMap() {
-  const cv = $("#sky"), dpr = window.devicePixelRatio || 1;
+  const cv = $("#sky"), dpr = Math.min(2, window.devicePixelRatio || 1);
   const W = cv.clientWidth, H = cv.clientHeight;
   if (!W || !H) return;
   for (const c of [cv, M.base]) {
@@ -324,11 +396,16 @@ function drawMap() {
   }
   const g = M.base.getContext("2d");
   g.setTransform(1, 0, 0, 1, 0, 0);
-  g.drawImage(skyBackground(W, H, dpr), 0, 0);
+  if (M.atmosphere) g.drawImage(skyBackground(W, H, dpr), 0, 0);
+  else { g.fillStyle = "#040914"; g.fillRect(0, 0, cv.width, cv.height); }
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   const f = M.frame;
+  $("#projectionLabel").textContent = `${M.proj.toUpperCase()} / 等比例投影`;
+  $("#mapEmpty").classList.toggle("hidden", !!f && !!M.pts.length);
   if (!f || !M.pts.length) {
-    M.toScreen = null; g.fillStyle = "#8a97b6"; g.font = "14px sans-serif"; g.fillText("该参考系暂无对象", W / 2 - 60, H / 2);
+    M.toScreen = null; M.markers = []; $("#mapVisible").textContent = "0";
+    $("#mapEmpty h2").textContent = "等待第一束星光";
+    $("#mapEmpty p").textContent = "有坐标的观测对象将在这里出现。";
     composite(); return;
   }
   if (!M.view) M.view = fitView(W, H);
@@ -346,48 +423,77 @@ function drawMap() {
     for (let x = Math.ceil(xa / step) * step; x <= xb; x += step) g.fillText(fmtAxis(x), sx(x) + 3, H - 30);
     for (let y = Math.ceil(ya / step) * step; y <= yb; y += step) g.fillText(fmtAxis(y), W / 2 > 300 ? 270 : 6, sy(y) - 3);
   }
-  if (xa <= 0 && 0 <= xb && ya <= 0 && 0 <= yb) {
+  if (M.grid && xa <= 0 && 0 <= xb && ya <= 0 && 0 <= yb) {
     const X = sx(0), Y = sy(0);
     g.strokeStyle = "rgba(245,184,75,0.45)"; g.lineWidth = 1; g.beginPath(); g.moveTo(X - 10, Y); g.lineTo(X + 10, Y); g.moveTo(X, Y - 10); g.lineTo(X, Y + 10); g.stroke();
     g.fillStyle = "rgba(245,184,75,0.75)"; g.font = `10px ${MONO}`; g.fillText("原点 (0,0)", X + 6, Y - 6);
   }
-  // data stars: soft halo + bright core, per colour (source-over keeps dense regions coloured, not white)
-  const groups = new Map();
-  for (const p of M.pts) {
-    const t = topId(p[1]);
-    if (M.hidden.has(t)) continue;
-    const X = sx(p[ix]), Y = sy(p[iy]);
-    if (X < -6 || Y < -6 || X > W + 6 || Y > H + 6) continue;
-    const c = catColor(t);
-    let a = groups.get(c); if (!a) groups.set(c, (a = []));
-    a.push(X, Y);
+  // Exact overlap in the chosen projection is shown once; its halo encodes the real object count.
+  // No offsets/jitter are added to the data, and points in other reference frames are never mixed.
+  const groupKey = `${M.proj}|${[...M.hidden].sort((a, b) => a - b).join(",")}`;
+  if (M.groupSource !== M.pts || M.groupTree !== S.tree || M.groupKey !== groupKey) {
+    const groups = new Map();
+    for (const p of M.pts) {
+      const t = topId(p[1]);
+      if (M.hidden.has(t)) continue;
+      const key = `${p[ix]}|${p[iy]}`;
+      let marker = groups.get(key);
+      if (!marker) { marker = { p, x: 0, y: 0, points: [], cats: new Set() }; groups.set(key, marker); }
+      marker.points.push(p); marker.cats.add(t);
+    }
+    M.grouped = [...groups.values()]; M.groupSource = M.pts; M.groupTree = S.tree; M.groupKey = groupKey;
   }
-  const pass = (rad, alpha) => {
+  let visible = 0;
+  M.markers = [];
+  for (const m of M.grouped) {
+    m.x = sx(m.p[ix]); m.y = sy(m.p[iy]);
+    if (m.x < 0 || m.y < 0 || m.x > W || m.y > H) continue;
+    M.markers.push(m); visible += m.points.length;
+  }
+  const singles = new Map();
+  for (const m of M.markers) {
+    const count = m.points.length, r = Math.min(17, 5 + Math.log2(count) * 1.25);
+    const color = m.cats.size === 1 ? catColor(topId(m.p[1])) : "#c7d6e9";
+    if (count === 1) { if (!singles.has(color)) singles.set(color, []); singles.get(color).push(m); continue; }
+    g.globalAlpha = .43; g.drawImage(starSprite(color), m.x - r, m.y - r, r * 2, r * 2);
+    const core = Math.min(2.5, 1.1 + Math.log2(count) * .12);
+    g.globalAlpha = .94; g.fillStyle = color; g.beginPath(); g.arc(m.x, m.y, core, 0, Math.PI * 2); g.fill();
+    g.fillStyle = "#f1f5ff"; g.globalAlpha = .87; g.beginPath(); g.arc(m.x, m.y, core * .42, 0, Math.PI * 2); g.fill();
+  }
+  // Batch ordinary stars by category: thousands of unique positions need only a few draw calls.
+  for (const [radius, alpha] of [[3.1, .09], [1.15, .86]]) {
     g.globalAlpha = alpha;
-    for (const [c, a] of groups) {
-      g.fillStyle = c; g.beginPath();
-      for (let i = 0; i < a.length; i += 2) { g.moveTo(a[i] + rad, a[i + 1]); g.arc(a[i], a[i + 1], rad, 0, 6.2832); }
+    for (const [color, markers] of singles) {
+      g.fillStyle = color; g.beginPath();
+      for (const m of markers) { g.moveTo(m.x + radius, m.y); g.arc(m.x, m.y, radius, 0, Math.PI * 2); }
       g.fill();
     }
-  };
-  pass(3.6, 0.09);   // halo
-  pass(1.35, 0.92);  // core
-  g.globalAlpha = 0.85; g.fillStyle = "#ffffff";   // pin-point highlight in each core
-  for (const a of groups.values()) for (let i = 0; i < a.length; i += 2) g.fillRect(a[i] - 0.35, a[i + 1] - 0.35, 0.7, 0.7);
+  }
   g.globalAlpha = 1;
+  $("#mapVisible").textContent = fmt(visible);
+  $("#mapVisible").title = `${fmt(visible)} 个对象，投影在 ${fmt(M.markers.length)} 个不同位置；重叠对象合并绘制`;
+  const allHidden = M.pts.length > 0 && M.pts.every((p) => M.hidden.has(topId(p[1])));
+  if (allHidden) {
+    $("#mapEmpty").classList.remove("hidden");
+    $("#mapEmpty h2").textContent = "图层已隐藏";
+    $("#mapEmpty p").textContent = "在左侧打开一个类别，继续探索。";
+  } else {
+    $("#mapEmpty h2").textContent = "等待第一束星光";
+    $("#mapEmpty p").textContent = "有坐标的观测对象将在这里出现。";
+  }
   // axis names and scale bar (bottom centre)
   g.fillStyle = "rgba(160,190,225,0.8)"; g.font = `11px ${MONO}`;
-  g.fillText(`${ax} →`, W - 380 > W / 2 ? W - 380 : W - 60, H - 14); g.fillText(`↑ ${ay}`, W / 2, 16);
-  const bar = step * k, bx = W / 2 - bar / 2, by = H - 16;
+  if (M.grid) { g.fillText(`${ax} →`, W - 70, H - 45); g.fillText(`↑ ${ay}`, W / 2, 24); }
+  const bar = step * k, bx = W - Math.max(160, bar + 90), by = W < 650 ? H - 112 : H - 30;
   g.strokeStyle = "rgba(200,225,255,0.75)"; g.lineWidth = 1.5; g.beginPath();
   g.moveTo(bx, by); g.lineTo(bx + bar, by); g.moveTo(bx, by - 4); g.lineTo(bx, by + 4); g.moveTo(bx + bar, by - 4); g.lineTo(bx + bar, by + 4); g.stroke();
-  g.fillText(`${fmtAxis(step)} ${f.unit}`, bx + bar + 8, by + 4);
+  g.fillText(`${fmtAxis(step)} ${f.unit}`, bx, by - 12);
   composite();
 }
 
 // top layer: base + locator ring (hover) + breathing target lock (selection); cheap enough per frame
 function composite(t) {
-  const cv = $("#sky"), dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  const cv = $("#sky"), dpr = Math.min(2, window.devicePixelRatio || 1), W = cv.clientWidth, H = cv.clientHeight;
   if (!W || !H) return;
   const g = cv.getContext("2d");
   g.setTransform(1, 0, 0, 1, 0, 0);
@@ -401,7 +507,7 @@ function composite(t) {
     g.stroke();
   }
   if (M.sel) {
-    const [X, Y] = M.toScreen(M.sel), ph = ((t ?? performance.now()) / 650) % 6.2832;
+    const [X, Y] = M.toScreen(M.sel), ph = reducedMotion.matches ? 0 : ((t ?? performance.now()) / 950) % 6.2832;
     const r = 10 + 2.5 * Math.sin(ph), a = 0.55 + 0.35 * Math.sin(ph);
     g.save(); g.shadowColor = "#f5b84b"; g.shadowBlur = 16;
     g.strokeStyle = `rgba(245,184,75,${a.toFixed(2)})`; g.lineWidth = 1.6; g.beginPath(); g.arc(X, Y, r, 0, 6.2832); g.stroke();
@@ -416,7 +522,7 @@ function composite(t) {
 }
 function pulse() {
   M.raf = 0;
-  if (S.tab !== "map" || !M.sel || document.hidden) return;
+  if (S.tab !== "map" || !M.sel || document.hidden || reducedMotion.matches) return;
   composite(performance.now());
   M.raf = requestAnimationFrame(pulse);
 }
@@ -425,43 +531,64 @@ const startPulse = () => { if (!M.raf) M.raf = requestAnimationFrame(pulse); };
 function pickAt(mx, my, rad = 9) {
   if (!M.toScreen) return null;
   let best = null, bd = rad * rad;
-  for (const p of M.pts) {
-    if (M.hidden.has(topId(p[1]))) continue;
-    const [X, Y] = M.toScreen(p), d = (X - mx) ** 2 + (Y - my) ** 2;
-    if (d < bd) { bd = d; best = p; }
+  for (const m of M.markers) {
+    const d = (m.x - mx) ** 2 + (m.y - my) ** 2;
+    if (d < bd) { bd = d; best = m.p; }
   }
   return best;
 }
-async function showMapDetail(id) {
+function overlapAt(p) {
+  const [ix, iy] = AX[M.proj];
+  return M.pts.filter((q) => !M.hidden.has(topId(q[1])) && q[ix] === p[ix] && q[iy] === p[iy]);
+}
+async function showMapDetail(id, position = 0) {
   const wrap = $("#mapDetailWrap");
+  const request = ++M.detailRequest;
   wrap.classList.remove("hidden");
   $("#mapDetail").innerHTML = `<p class="hint">读取 ${esc(id)} …</p>`;
-  try { $("#mapDetail").innerHTML = objectHtml(await api("/api/object/" + encodeURIComponent(id))); }
-  catch (e) { $("#mapDetail").innerHTML = `<p class="badge bad">${esc(e.message)}</p>`; }
+  try {
+    const object = await api("/api/object/" + encodeURIComponent(id));
+    if (request !== M.detailRequest) return;
+    $("#mapDetail").innerHTML = (M.picked.length > 1 ? `<div class="overlap-note">此投影位置重叠 ${fmt(M.picked.length)} 个对象 · 当前 ${position + 1}<br><button id="overlapNext" class="text-button">查看下一个对象 →</button></div>` : "") + objectHtml(object);
+    if ($("#overlapNext")) $("#overlapNext").onclick = () => {
+      const next = (position + 1) % M.picked.length;
+      M.sel = M.picked[next]; composite(); showMapDetail(`${S.test}-${M.sel[0]}`, next);
+    };
+  } catch (e) { if (request === M.detailRequest) $("#mapDetail").innerHTML = `<p class="badge bad">${esc(e.message)}</p>`; }
 }
 const sky = $("#sky");
 const rel = (e) => { const r = sky.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+let mapDrawPending = false;
+function scheduleMapDraw() { if (!mapDrawPending) { mapDrawPending = true; requestAnimationFrame(() => { mapDrawPending = false; drawMap(); }); } }
+function zoomMap(factor, mx = sky.clientWidth / 2, my = sky.clientHeight / 2) {
+  if (!M.view) return;
+  const W = sky.clientWidth, H = sky.clientHeight, v = M.view;
+  const dx = v.cx + (mx - W / 2) / v.k, dy = v.cy - (my - H / 2) / v.k;
+  const k2 = Math.min(Math.max(v.k * factor, 1e-12), 1e12);
+  M.view = { k: k2, cx: dx - (mx - W / 2) / k2, cy: dy + (my - H / 2) / k2 };
+  scheduleMapDraw();
+}
 sky.addEventListener("wheel", (e) => {
   e.preventDefault();
-  if (!M.view) return;
-  const [mx, my] = rel(e), W = sky.clientWidth, H = sky.clientHeight, v = M.view;
-  const dx = v.cx + (mx - W / 2) / v.k, dy = v.cy - (my - H / 2) / v.k;          // the data point under the cursor stays put
-  const k2 = Math.min(Math.max(v.k * Math.exp(-e.deltaY * 0.0015), 1e-12), 1e12);
-  M.view = { k: k2, cx: dx - (mx - W / 2) / k2, cy: dy + (my - H / 2) / k2 };
-  drawMap();
+  const [mx, my] = rel(e); zoomMap(Math.exp(-e.deltaY * .0015), mx, my);
 }, { passive: false });
-sky.addEventListener("mousedown", (e) => { const [mx, my] = rel(e); M.drag = { mx, my, cx: M.view?.cx, cy: M.view?.cy, moved: false }; });
-window.addEventListener("mouseup", (e) => {
+sky.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0 || !e.isPrimary || !M.view) return;
+  sky.focus({ preventScroll: true }); sky.setPointerCapture(e.pointerId);
+  const [mx, my] = rel(e); M.drag = { mx, my, cx: M.view.cx, cy: M.view.cy, moved: false };
+});
+window.addEventListener("pointerup", (e) => {
   const d = M.drag; M.drag = null;
   if (!d || d.moved || S.tab !== "map") return;
   const [mx, my] = rel(e), p = pickAt(mx, my);
-  if (p) { M.sel = p; composite(); startPulse(); showMapDetail(`${S.test}-${p[0]}`); }
+  if (p) { M.sel = p; M.picked = overlapAt(p); composite(); startPulse(); showMapDetail(`${S.test}-${p[0]}`); }
 });
-sky.addEventListener("mousemove", (e) => {
+sky.addEventListener("pointercancel", () => { M.drag = null; });
+sky.addEventListener("pointermove", (e) => {
   const [mx, my] = rel(e), d = M.drag;
   if (d && M.view) {
     if (Math.abs(mx - d.mx) + Math.abs(my - d.my) > 3) d.moved = true;
-    if (d.moved) { M.view = { ...M.view, cx: d.cx - (mx - d.mx) / M.view.k, cy: d.cy + (my - d.my) / M.view.k }; drawMap(); }
+    if (d.moved) { M.view = { ...M.view, cx: d.cx - (mx - d.mx) / M.view.k, cy: d.cy + (my - d.my) / M.view.k }; scheduleMapDraw(); }
     $("#tip").classList.add("hidden");
     return;
   }
@@ -470,26 +597,44 @@ sky.addEventListener("mousemove", (e) => {
   const tip = $("#tip");
   if (p) {
     const [ix, iy] = AX[M.proj], n = S.tree?.by.get(p[1]);
-    tip.textContent = `${n ? n.name : "#" + p[1]}  ·  ${S.test}-${p[0]}  ·  (${fmtAxis(p[ix])}, ${fmtAxis(p[iy])}) ${M.frame?.unit ?? ""}`;
-    tip.style.left = Math.max(0, Math.min(mx + 16, sky.clientWidth - 330)) + "px"; tip.style.top = my + 14 + "px";
+    const count = M.markers.find((m) => m.p === p)?.points.length || 1;
+    tip.textContent = `${n ? n.name : "#" + p[1]}${count > 1 ? ` · ${fmt(count)} 个对象在此投影重叠` : ""} · (${fmtAxis(p[ix])}, ${fmtAxis(p[iy])}) ${M.frame?.unit ?? ""}`;
     tip.classList.remove("hidden");
+    tip.style.left = Math.max(8, Math.min(mx + 16, sky.clientWidth - tip.offsetWidth - 8)) + "px";
+    tip.style.top = Math.max(8, Math.min(my + 16, sky.clientHeight - tip.offsetHeight - 8)) + "px";
   } else tip.classList.add("hidden");
 });
-sky.addEventListener("mouseleave", () => { $("#tip").classList.add("hidden"); if (M.hover) { M.hover = null; composite(); } });
+sky.addEventListener("pointerleave", () => { $("#tip").classList.add("hidden"); if (M.hover) { M.hover = null; composite(); } });
 $("#frame").onchange = () => { M.frame = M.frames[Number($("#frame").value)]; renderMap(false); };
 document.querySelectorAll("#projSeg button").forEach((b) => b.onclick = () => {
   M.proj = b.dataset.proj;
-  document.querySelectorAll("#projSeg button").forEach((x) => x.classList.toggle("on", x === b));
+  document.querySelectorAll("#projSeg button").forEach((x) => { x.classList.toggle("on", x === b); x.setAttribute("aria-pressed", String(x === b)); });
+  M.hover = null; M.sel = null; M.detailRequest++; $("#mapDetailWrap").classList.add("hidden"); $("#tip").classList.add("hidden");
   M.view = null; M.key = mapKey(); drawMap();
 });
 $("#fit").onclick = () => { M.view = null; drawMap(); };
-$("#resetView").onclick = () => { M.view = null; M.hidden.clear(); M.sel = null; $("#mapDetailWrap").classList.add("hidden"); renderMapChrome(); drawMap(); };
+$("#resetView").onclick = () => { M.view = null; M.hidden.clear(); M.sel = null; M.hover = null; M.detailRequest++; $("#mapDetailWrap").classList.add("hidden"); $("#tip").classList.add("hidden"); renderMapChrome(); drawMap(); };
 $("#mapGrid").onchange = () => { M.grid = $("#mapGrid").checked; drawMap(); };
-$("#mdClose").onclick = () => { M.sel = null; $("#mapDetailWrap").classList.add("hidden"); composite(); };
+$("#mapAtmosphere").onchange = () => { M.atmosphere = $("#mapAtmosphere").checked; drawMap(); };
+$("#mapAuto").onchange = renderMapChrome;
+$("#zoomIn").onclick = () => zoomMap(1.5);
+$("#zoomOut").onclick = () => zoomMap(1 / 1.5);
+$("#mdClose").onclick = () => { M.sel = null; M.detailRequest++; $("#mapDetailWrap").classList.add("hidden"); composite(); };
+sky.onkeydown = (e) => {
+  if (!M.view) return;
+  const directions = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] };
+  if (directions[e.key]) { e.preventDefault(); const [x, y] = directions[e.key]; M.view.cx += x * 70 / M.view.k; M.view.cy += y * 70 / M.view.k; scheduleMapDraw(); }
+  else if (e.key === "+" || e.key === "=") { e.preventDefault(); zoomMap(1.5); }
+  else if (e.key === "-") { e.preventDefault(); zoomMap(1 / 1.5); }
+  else if (e.key === "0") { e.preventDefault(); M.view = null; drawMap(); }
+  else if (e.key === "Escape") $("#mdClose").click();
+};
 $("#legend").onclick = (e) => {
   const b = e.target.closest("button[data-top]"); if (!b) return;
   const t = Number(b.dataset.top);
   M.hidden.has(t) ? M.hidden.delete(t) : M.hidden.add(t);
+  if (M.sel && M.hidden.has(topId(M.sel[1]))) $("#mdClose").click();
+  M.hover = null; $("#tip").classList.add("hidden");
   renderMapChrome(); drawMap();
 };
 
@@ -549,7 +694,7 @@ async function refresh(force) {
   if (busy) return; busy = true;
   try {
     if (!S.test || force) await loadTests();
-    if (!S.test) { $("#kpis").innerHTML = `<div class="kpi"><div class="v">等待数据</div><div class="l">发生器尚未发送任何消息</div></div>`; return; }
+    if (!S.test) { $("#kpis").innerHTML = `<div class="kpi"><div class="v">等待数据</div><div class="l">发生器尚未发送任何消息</div></div>`; if (S.tab === "map") { M.frame = null; M.pts = []; renderMapChrome(); drawMap(); } return; }
     if (S.tab === "overview") await renderOverview();
     else if (S.tab === "explore") { await renderTree(force); if (force) await loadObjects(true); }
     else if (S.tab === "map") { if (force) await renderMap(true); }
@@ -563,7 +708,7 @@ let tick = 0;
 setInterval(() => {
   tick++;
   if (S.tab === "overview" || (S.tab === "trust" && tick % 3 === 0)) refresh(false);
-  if (S.tab === "map" && $("#mapAuto").checked && tick % 3 === 0) renderMap(true).catch((e) => console.warn(e));
+  if (S.tab === "map" && $("#mapAuto").checked && tick % 3 === 0) { if (S.test) renderMap(true).catch((e) => console.warn(e)); else refresh(true); }
   if (tick % 10 === 0) { loadTests(); S.treeStale = true; }
 }, 2000);
 refresh(true);

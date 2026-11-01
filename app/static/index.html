@@ -5,27 +5,28 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>宇宙万物观测站</title>
 <link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/sky.css?v=2">
 <script src="/static/vendor/echarts.min.js"></script>
 </head>
 <body>
 <header>
-  <div class="brand">🔭 宇宙万物观测站 <span class="sub">Cosmos Observatory</span></div>
+  <div class="brand"><svg class="brand-mark" viewBox="0 0 40 40" fill="none" aria-hidden="true"><circle cx="20" cy="20" r="10"/><ellipse cx="20" cy="20" rx="19" ry="7" transform="rotate(-35 20 20)"/><circle class="brand-star" cx="20" cy="20" r="3"/></svg><span>宇宙万物观测站<small>COSMOS OBSERVATORY</small></span></div>
   <nav id="tabs">
-    <button data-tab="overview" class="on">总览</button>
+    <button data-tab="overview">总览</button>
     <button data-tab="explore">万物目录</button>
-    <button data-tab="map">星图</button>
+    <button data-tab="map" class="on">星图</button>
     <button data-tab="evolve">演化</button>
     <button data-tab="trust">数据可信</button>
   </nav>
   <div class="right">
-    <label>观测轮次 <select id="test"></select></label>
+    <label class="session-label"><span>观测轮次</span><select id="test" aria-label="观测轮次"></select></label>
     <span id="live" class="dot" title="自动刷新"></span>
   </div>
 </header>
 
-<main>
+<main class="full">
   <!-- overview -->
-  <section id="overview" class="tab on">
+  <section id="overview" class="tab">
     <div class="kpis" id="kpis"></div>
     <div class="grid2">
       <div class="card"><h3>实时摄入（对象/秒，按提交时间）</h3><div id="rateChart" class="chart"></div></div>
@@ -59,31 +60,38 @@
   </section>
 
   <!-- map -->
-  <section id="map" class="tab">
+  <section id="map" class="tab on">
     <div class="observatory">
-      <canvas id="sky"></canvas>
+      <canvas id="sky" tabindex="0" aria-label="交互星图：方向键平移，加减号缩放，0 适应全部；可在万物目录中查看对象"></canvas>
       <div id="tip" class="tip hidden"></div>
-      <div class="hud hud-left panel">
-        <h3>参考系</h3>
-        <select id="frame" class="full"></select>
-        <p class="hint">一次只看一个参考系（类型 · ID · 单位）。局部坐标系之间没有已知变换，不合并显示。</p>
-        <h3>投影</h3>
-        <div class="seg" id="projSeg"><button data-proj="xy" class="on">X–Y</button><button data-proj="xz">X–Z</button><button data-proj="yz">Y–Z</button></div>
-        <h3>视图</h3>
-        <div class="seg"><button id="fit">适应全部</button><button id="resetView">重置</button></div>
-        <label class="chk"><input type="checkbox" id="mapAuto" checked> 自动刷新（6 秒，保留视野）</label>
-        <label class="chk"><input type="checkbox" id="mapGrid" checked> 坐标网格</label>
-        <div class="hint mono" id="mapUpdated"></div>
-        <h3>类别 <small>点击显示 / 隐藏</small></h3>
-        <div id="legend" class="legend col"></div>
+      <div class="hud scene-sidebar">
+        <div class="scene-heading"><span class="eyebrow">THE LIVING ATLAS</span><h1>万物星图<span>探索，始于一个坐标。</span></h1><div id="frameCaption" class="frame-caption">等待观测数据</div></div>
+        <div class="panel controls-panel">
+          <div class="panel-label"><span>观测空间</span><span class="tiny-orbit" aria-hidden="true">◎</span></div>
+          <select id="frame" class="full" aria-label="参考系"></select>
+          <details class="map-settings"><summary>观测设置<span>投影与显示</span></summary><div class="settings-body">
+            <div class="seg" id="projSeg" aria-label="投影平面"><button data-proj="xy" class="on" aria-pressed="true">X–Y</button><button data-proj="xz" aria-pressed="false">X–Z</button><button data-proj="yz" aria-pressed="false">Y–Z</button></div>
+            <label class="chk"><input type="checkbox" id="mapAuto" checked> 每 6 秒更新，保持视野</label>
+            <label class="chk"><input type="checkbox" id="mapGrid"> 显示坐标网格</label>
+            <label class="chk"><input type="checkbox" id="mapAtmosphere" checked> 深空氛围背景</label>
+            <button id="resetView" class="text-button">重置视图与类别</button>
+          </div></details>
+          <div class="category-heading"><span>星图图层</span><small>按类别</small></div>
+          <div id="legend" class="legend col"></div>
+          <div class="update-line"><span class="status-pin"></span><span id="mapUpdated">等待连接</span></div>
+        </div>
       </div>
-      <div class="hud hud-top">
-        <span id="mapFilter" class="chip hidden"></span>
-        <span id="mapCount" class="hudtext mono"></span>
+      <div class="hud filter-position"><span id="mapFilter" class="chip hidden"></span></div>
+      <div class="hud scene-info"><span class="projection-tag" id="projectionLabel">XY / 等比例投影</span><details class="info-popover"><summary aria-label="星图与数据说明">i</summary><div class="panel"><h3>关于这片星空</h3><p id="mapCount">正在读取观测数据…</p><p>每次仅展示同一参考系的坐标。不同参考系之间没有已知变换。</p><p>光点代表真实对象；重叠位置合并绘制，光晕大小表示重叠数量。星云与远景星尘仅为装饰，可在观测设置中关闭。</p></div></details></div>
+      <div id="mapEmpty" class="map-empty hidden"><span class="empty-orbit">◎</span><h2>等待第一束星光</h2><p>有坐标的观测对象将在这里出现。</p></div>
+      <div class="hud scene-bottom">
+        <div class="map-stats"><div><strong id="mapVisible">—</strong><span>视野内对象</span></div><div><strong id="mapLoaded">—</strong><span>已载入对象</span></div><div><strong id="mapTotal">—</strong><span>参考系累计</span></div></div>
+        <div class="interaction-hint">拖动探索<span>·</span>滚轮缩放<span>·</span>点击光点查看</div>
       </div>
-      <div class="hud hud-bottom hudtext">滚轮缩放 · 拖动平移 · 点击星点锁定目标 · 背景星尘与星云只是装饰（固定在屏幕上，不随视图移动，不可点击），所有星点都是真实对象的真实坐标</div>
+      <div class="hud view-tools"><button id="zoomIn" title="放大（+）" aria-label="放大">+</button><button id="zoomOut" title="缩小（−）" aria-label="缩小">−</button><span></span><button id="fit" title="适应全部（0）" aria-label="适应全部">⌖</button></div>
       <aside class="hud hud-right panel hidden" id="mapDetailWrap">
         <button class="close" id="mdClose" title="关闭">✕</button>
+        <div class="detail-kicker">OBJECT / 观测档案</div>
         <div id="mapDetail"></div>
       </aside>
     </div>
@@ -118,6 +126,6 @@
   <div id="mbody"></div>
 </div></div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=2"></script>
 </body>
 </html>
